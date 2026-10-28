@@ -66,7 +66,7 @@ AL2401_mllw_mhw_20250101T12.lines.geojson  AL2401_mllw_mhw_20250101T12.pts.dbf
 ## QC
 Run the script `qc.py`, with two required command line arguments:
 ```
-python qc.py <project_name> <path_to_images_file>.csv <STOFS_forecast_initialization>
+python qc.py <project_name> <path_to_images_file>.csv
 ```
 replacing the parts in angle brackets `<...>` with actual values. More detailed descriptions of these arguments, as well as a number of additional, optional command line arguments, can be accessed by running
 ```
