@@ -127,9 +127,11 @@ def main(
     logger.info('Finished loading forecast subset.')
     
     logger.info('Adding datums...')
-    # We want all in `datums`, except BMHW, plus MLW and MHW to calculate range.
+    # We want all in `datums`, except BMHW, plus MHW, MLW and MLLW to calculate
+    # range (MHW - MLW, or MHW - MLLW for West Coast/Alaska). Adding them here,
+    # on the full mesh, means ds_add_tidal_range never has to add one later.
     datums_to_add = [d for d in datums if d != 'bmhw']
-    for datum in list(set(datums_to_add + ['mhw', 'mlw'])):
+    for datum in list(set(datums_to_add + ['mhw', 'mlw', 'mllw'])):
         ds_mesh = mesh_handling.ds_add_datum(ds_mesh, datum)
     logger.info('Finished adding datums...')
     

@@ -101,7 +101,8 @@ def output_all_prediction(
     project_name: str,
     datum_list: List[str],
     init_datetime: datetime.datetime,
-    outdir: str | pathlib.Path
+    outdir: str | pathlib.Path,
+    notes: List[str] | None = None
 ) -> None:
     """Write all outputs for time window predictions.
     
@@ -126,12 +127,18 @@ def output_all_prediction(
         The forecast initialization time, used in the output filenames.
     outdir
         The directory in which to save output files.
+    notes
+        Optional messages (e.g., why some datums have no windows)
+        written at the top of the text outputs.
 
     Returns
     -------
     None
     
     """
+    if df_line_windows.empty:
+        logger.warning('No time windows found for any flight line. Output files '
+                       'are still written; the text files explain why.')
     logger.info("Saving geopackage prediction output...")
     geopackage_prediction(df_lines, df_line_windows, df_points, df_point_windows, project_name, datum_list, init_datetime,outdir)
     logger.info("Saving line prediction shapefile...")
@@ -143,9 +150,9 @@ def output_all_prediction(
     logger.info("Saving point prediction geojson...")
     points_geojson_prediction(df_points, df_point_windows, project_name, datum_list, init_datetime, outdir)
     logger.info("Saving line-wise prediction text file...")
-    line_text_prediction(df_lines, df_line_windows, project_name, datum_list, init_datetime, outdir)
+    line_text_prediction(df_lines, df_line_windows, project_name, datum_list, init_datetime, outdir, notes)
     logger.info("Saving date-wise prediction text file...")
-    date_text_prediction(df_lines, df_line_windows, project_name, datum_list, init_datetime, outdir)
+    date_text_prediction(df_lines, df_line_windows, project_name, datum_list, init_datetime, outdir, notes)
     return None
 
 def geopackage_prediction(
@@ -485,13 +492,33 @@ def points_geojson_prediction(
     return None
 
 
+def _write_notes(outfile, notes: List[str] | None) -> None:
+    """Write explanatory notes at the top of a text output file."""
+    for note in notes or []:
+        outfile.write(f'NOTE: {note}\n')
+    if notes:
+        outfile.write('\n')
+
+
+def _write_timezone(outfile, df_line_windows: pd.DataFrame) -> None:
+    """Write the common time zone of the windows, or log an error if mixed."""
+    sttzi = df_line_windows.start_time.apply(lambda t: t.tzinfo)
+    ettzi = df_line_windows.end_time.apply(lambda t: t.tzinfo)
+    tz0 = sttzi.iloc[0]
+    if (sttzi == tz0).all() & (ettzi == tz0).all():
+        outfile.write(f"All times {tz0} ({tz0.__repr__()})" + '\n')
+    else:
+        logger.error('Multiple timezones found in df_line_windows.')
+
+
 def line_text_prediction(
     df_lines: gpd.GeoDataFrame,
     df_line_windows: pd.DataFrame,
     project_name: str,
     datum_list: List[str],
     init_datetime: datetime.datetime,
-    outdir: str | pathlib.Path
+    outdir: str | pathlib.Path,
+    notes: List[str] | None = None
 ) -> None:
     """Write a text file with time windows by line then date.
 
@@ -512,14 +539,17 @@ def line_text_prediction(
     filename = '_'.join([project_name, '_'.join(datum_list), datestr])
     outfile = open(pathlib.Path(outdir) / (filename + fileext), 'a')
     
+    # Explanatory notes (e.g., why a datum has no windows) go first.
+    _write_notes(outfile, notes)
+
+    # With no windows at all there is nothing to tabulate.
+    if df_line_windows.empty:
+        outfile.write('No time windows found for any flight line in this forecast.\n')
+        outfile.close()
+        return None
+
     # Get time zone info.
-    sttzi = df_line_windows.start_time.apply(lambda t: t.tzinfo)
-    ettzi = df_line_windows.end_time.apply(lambda t: t.tzinfo)
-    if (sttzi == sttzi[0]).all() & (ettzi == ettzi[0]).all() & (sttzi[0] == ettzi[0]):
-        tz_str = f"All times {sttzi[0]} ({sttzi[0].__repr__()})"
-        outfile.write(tz_str + '\n')
-    else:
-        logger.error('Multiple timezones found in df_line_windows.')
+    _write_timezone(outfile, df_line_windows)
     
     # Format datetimes as needed.
     df = df_line_windows.copy()
@@ -580,7 +610,8 @@ def date_text_prediction(
     project_name: str,
     datum_list: List[str],
     init_datetime: datetime.datetime,
-    outdir: str | pathlib.Path
+    outdir: str | pathlib.Path,
+    notes: List[str] | None = None
 ) -> None:
     """Write a text file with time windows by date then line.
 
@@ -600,14 +631,17 @@ def date_text_prediction(
     filename = '_'.join([project_name, '_'.join(datum_list), datestr])
     outfile = open(pathlib.Path(outdir) / (filename + fileext), 'a')
     
+    # Explanatory notes (e.g., why a datum has no windows) go first.
+    _write_notes(outfile, notes)
+
+    # With no windows at all there is nothing to tabulate.
+    if df_line_windows.empty:
+        outfile.write('No time windows found for any flight line in this forecast.\n')
+        outfile.close()
+        return None
+
     # Get time zone info.
-    sttzi = df_line_windows.start_time.apply(lambda t: t.tzinfo)
-    ettzi = df_line_windows.end_time.apply(lambda t: t.tzinfo)
-    if (sttzi == sttzi[0]).all() & (ettzi == ettzi[0]).all() & (sttzi[0] == ettzi[0]):
-        tz_str = f"All times {sttzi[0]} ({sttzi[0].__repr__()})"
-        outfile.write(tz_str + '\n')
-    else:
-        logger.error('Multiple timezones found in df_line_windows.')
+    _write_timezone(outfile, df_line_windows)
     
     # Format datetimes as needed.
     df = df_line_windows.copy()

@@ -4,6 +4,7 @@ Functions
 ---------
 get_box
 load_forecast_ds
+zeta_byte_range_layout
 get_nearest_inds_dists
 ds_add_datum
 ds_add_tidal_range
@@ -24,6 +25,9 @@ import scipy
 import s3fs
 import xarray_subset_grid
 import math
+import asyncio
+import concurrent.futures
+import obstore
 from coastalmodeling_vdatum import vdatum
 from obstore.store import S3Store
 from virtualizarr.parsers import HDFParser
@@ -58,14 +62,31 @@ def get_box(geometries: gpd.GeoDataFrame,
     return bbox
 
 
-def load_forecast_ds(init_datetime: datetime.datetime, 
+STOFS_BUCKET = 'noaa-gestofs-pds'
+LMSL_PATH = 'noaa-nos-stofs2d-pds/_archive/msl_2017-2019_avg/GSTOFSv5.6.5_msl_2017-2019_avg_20241619.nc'
+
+
+def load_forecast_ds(init_datetime: datetime.datetime,
                      bbox: shapely.box,
-                     convert_to_local_msl: bool = True) -> xarray.Dataset:
-    """Subset and load a mesh file for a lat-lon box, using xarray-subset-grid.
+                     convert_to_local_msl: bool = True,
+                     allow_byte_ranges: bool = True) -> xarray.Dataset:
+    """Load STOFS-2D-Global forecast water levels for a lat-lon box.
 
     Hardcoded to return a single STOFS-2D-Global forecast run.
-    
-    Can be slow (~15 minutes).
+
+    Two loading methods are available:
+
+    * Byte-range reads (fast). Used only if the water level variable
+      (zeta) is stored uncompressed and unfiltered in the source file,
+      which makes the byte position of every (time, node) value
+      computable. Only the bytes for nodes inside bbox are downloaded,
+      instead of whole 12.8 MB global chunks for every time step.
+    * xarray-subset-grid (slow, ~5+ minutes). Used if the data are
+      compressed or filtered, if allow_byte_ranges is False, or if
+      the fast method fails for any reason.
+
+    Both return the same structure: zeta (time, node) for nodes in bbox,
+    with lat and lon coordinates.
 
     Parameters
     ----------
@@ -75,31 +96,32 @@ def load_forecast_ds(init_datetime: datetime.datetime,
         The bounding box of the region to load.
     convert_to_local_msl
         Whether or not to convert to local mean sea level.
-    
+    allow_byte_ranges
+        Whether the fast byte-range method may be used (when the source
+        file allows it). Set False to force the xarray-subset-grid method.
+
     Returns
     -------
     xarray dataset containing forecast data on original model mesh.
-    
+
     """
-    
-    # Load global dataset.
+    # Open global dataset (metadata only) as a virtual zarr store.
     yyyymmdd = init_datetime.strftime('%Y%m%d')
     hh = init_datetime.strftime('%H')
-    aws_bucket = 'noaa-gestofs-pds'
     subdir = f'stofs_2d_glo.{yyyymmdd}'
     filename = f'stofs_2d_glo.t{hh}z.fields.cwl.nc'
     #
     store = S3Store(
-        bucket=aws_bucket,
+        bucket=STOFS_BUCKET,
         region="us-east-1",
         skip_signature=True,
         client_options={"timeout": "300s", "connect_timeout":"60s"},
         retry_config={"max_attempts": 5}
     )
-    registry = ObjectStoreRegistry({f"s3://{aws_bucket}": store})
+    registry = ObjectStoreRegistry({f"s3://{STOFS_BUCKET}": store})
     parser = HDFParser()
     manifest_store = parser(
-        url=f"s3://{aws_bucket}/{subdir}/{filename}",
+        url=f"s3://{STOFS_BUCKET}/{subdir}/{filename}",
         registry=registry
     )
     logger.info('Opening data file...')
@@ -109,11 +131,241 @@ def load_forecast_ds(init_datetime: datetime.datetime,
         zarr_format=3,
     )
     logger.info('Finished opening data file.')
+
+    if allow_byte_ranges:
+        layout = zeta_byte_range_layout(manifest_store)
+        if isinstance(layout, str):
+            logger.info(f'Byte-range loading not possible ({layout}). '
+                        'Using xarray-subset-grid instead (slower).')
+        else:
+            logger.info('Forecast water levels are stored uncompressed: '
+                        'using byte-range loading.')
+            try:
+                return _load_forecast_byte_ranges(
+                    store, ds, layout, bbox, convert_to_local_msl
+                )
+            except Exception as e:
+                logger.warning(f'Byte-range loading failed ({e!r}). '
+                               'Falling back to xarray-subset-grid (slower).')
+    else:
+        logger.info('Byte-range loading disabled: using xarray-subset-grid.')
+
+    return _load_forecast_xsg(ds, bbox, convert_to_local_msl)
+
+
+def zeta_byte_range_layout(manifest_store, var: str = 'zeta') -> dict | str:
+    """Check whether a variable can be read with plain byte-range requests.
+
+    This is only safe when every chunk is stored as raw bytes: no
+    compression, no filters (e.g., shuffle), and every chunk present
+    in the file at exactly its uncompressed size.
+
+    Parameters
+    ----------
+    manifest_store
+        VirtualiZarr ManifestStore for the forecast file.
+    var
+        Name of the variable to check.
+
+    Returns
+    -------
+    dict describing the chunk layout if byte-range reads are possible,
+    otherwise a string giving the reason they are not.
+
+    """
+    try:
+        vds = manifest_store.to_virtual_dataset()
+    except Exception as e:
+        return f'could not read chunk manifest: {e!r}'
+    if var not in vds.variables:
+        return f'variable {var} not found'
+    marr = vds[var].data
+    meta = marr.metadata.to_dict()
+    codecs = meta.get('codecs', ())
+    codec_names = [c['name'] if isinstance(c, dict) else str(c) for c in codecs]
+    if codec_names != ['bytes']:
+        return f'{var} is compressed or filtered (codecs: {codec_names})'
+    if meta.get('storage_transformers'):
+        return f'{var} uses storage transformers'
+    if meta['chunk_grid']['name'] != 'regular':
+        return f'{var} does not use a regular chunk grid'
+    endian = codecs[0].get('configuration', {}).get('endian', 'little')
+    dtype = numpy.dtype(meta['data_type']).newbyteorder('<' if endian == 'little' else '>')
+    shape = tuple(meta['shape'])
+    chunk_shape = tuple(meta['chunk_grid']['configuration']['chunk_shape'])
+    if len(shape) != 2:
+        return f'{var} has {len(shape)} dimensions, expected 2 (time, node)'
+    n_chunks = tuple(math.ceil(s / c) for s, c in zip(shape, chunk_shape))
+    chunk_bytes = math.prod(chunk_shape) * dtype.itemsize
+    entries = marr.manifest.dict()
+    if len(entries) != math.prod(n_chunks):
+        return f'{var} has missing chunks ({len(entries)} of {math.prod(n_chunks)} stored)'
+    chunks = {}
+    for key, entry in entries.items():
+        if entry['length'] != chunk_bytes:
+            return (f'{var} chunk {key} is {entry["length"]} bytes, not the raw '
+                    f'size {chunk_bytes}, so it must be encoded')
+        idx = tuple(int(i) for i in key.replace('/', '.').split('.'))
+        chunks[idx] = (entry['path'], entry['offset'])
+    return {'var': var, 'dtype': dtype, 'shape': shape,
+            'chunk_shape': chunk_shape, 'chunks': chunks,
+            'fill_value': meta.get('fill_value')}
+
+
+def _read_nodes_byte_ranges(store, layout: dict, node_idx: numpy.ndarray,
+                            max_gap_nodes: int = 2048,
+                            max_concurrency: int = 64) -> numpy.ndarray:
+    """Read values of a (time, node) variable for selected nodes only.
+
+    Contiguous runs of the selected node indices (merged across gaps of
+    up to max_gap_nodes, and split at chunk boundaries) are each fetched
+    as one byte range per time step. The ranges for each time step are
+    fetched as one obstore call (which coalesces nearby ranges), with up
+    to max_concurrency time steps fetched at once.
+
+    Returns
+    -------
+    numpy array with shape (n_time, len(node_idx)).
+
+    """
+    dtype = layout['dtype']
+    item = dtype.itemsize
+    n_time = layout['shape'][0]
+    ct, cn = layout['chunk_shape']
+    node_idx = numpy.asarray(node_idx)
+    # Runs of selected nodes, as [start, end) node indices, split at chunk edges.
+    runs = []
+    run_start = prev = int(node_idx[0])
+    for n in node_idx[1:]:
+        n = int(n)
+        if n - prev > max_gap_nodes or n // cn != run_start // cn:
+            runs.append((run_start, prev + 1))
+            run_start = n
+        prev = n
+    runs.append((run_start, prev + 1))
+    # Build one request per (time, run).
+    requests = {}  # path -> list of (start_byte, end_byte, t, run_start, run_end)
+    for t in range(n_time):
+        for r0, r1 in runs:
+            path, chunk_offset = layout['chunks'][(t // ct, r0 // cn)]
+            within = ((t % ct) * cn + (r0 % cn)) * item
+            start = chunk_offset + within
+            requests.setdefault(path, []).append((start, start + (r1 - r0) * item, t, r0, r1))
+    n_req = sum(len(v) for v in requests.values())
+    n_bytes = sum(e - s for v in requests.values() for s, e, *_ in v)
+    logger.info(f'Fetching {len(node_idx)} nodes x {n_time} times: {len(runs)} node '
+                f'runs, {n_req} byte ranges, {n_bytes / 1e6:.1f} MB.')
+    # Fetch: one batch per (file, time step), with up to max_concurrency
+    # batches in flight. Many small ranges are latency-bound, so running
+    # them concurrently matters far more than the number of bytes.
+    batches = {}
+    for path, reqs in requests.items():
+        key = path.split('://', 1)[-1].split('/', 1)[1]  # strip s3://bucket/
+        for r in reqs:
+            batches.setdefault((key, r[2]), []).append(r)
+
+    async def fetch_all():
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async def fetch(key, reqs):
+            async with sem:
+                bufs = await obstore.get_ranges_async(
+                    store, key,
+                    starts=[r[0] for r in reqs],
+                    ends=[r[1] for r in reqs]
+                )
+            return reqs, bufs
+
+        return await asyncio.gather(*(fetch(k, v) for (k, _), v in batches.items()))
+
+    results = _run_coroutine(fetch_all())
+
+    # Scatter into output.
+    out = numpy.empty((n_time, len(node_idx)), dtype=dtype.newbyteorder('='))
+    for reqs, buffers in results:
+        for (s, e, t, r0, r1), buf in zip(reqs, buffers):
+            vals = numpy.frombuffer(buf, dtype=dtype)
+            sel = (node_idx >= r0) & (node_idx < r1)
+            out[t, sel] = vals[node_idx[sel] - r0]
+    return out
+
+
+def _run_coroutine(coro):
+    """Run a coroutine to completion, also from inside a running event loop
+    (e.g., a Jupyter notebook), by using a separate thread in that case."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+def _load_forecast_byte_ranges(store, ds: xarray.Dataset, layout: dict,
+                               bbox: shapely.box,
+                               convert_to_local_msl: bool) -> xarray.Dataset:
+    """Load zeta for nodes in bbox via byte-range reads (see load_forecast_ds)."""
+    logger.info('Loading mesh node coordinates...')
+    x = ds['x'].values
+    y = ds['y'].values
+    minx, miny, maxx, maxy = bbox.bounds
+    lon = switch_lon_lims(x, min_lon=-180.0) if minx < 0 else switch_lon_lims(x, min_lon=0.0)
+    node_idx = numpy.flatnonzero((lon >= minx) & (lon <= maxx) & (y >= miny) & (y <= maxy))
+    if len(node_idx) == 0:
+        raise ValueError(f'no forecast mesh nodes inside box {bbox.bounds}')
+    logger.info(f'{len(node_idx)} mesh nodes inside the box.')
+
+    logger.info('Loading water levels with byte-range requests...')
+    zeta = _read_nodes_byte_ranges(store, layout, node_idx).astype('float32')
+    # Mask missing (dry) values the same way xarray does when opening
+    # the file, i.e., using the stored fill value.
+    fill = layout['fill_value']
+    if fill is not None:
+        zeta[numpy.isclose(zeta, fill, rtol=1e-6)] = numpy.nan
+    logger.info('Finished loading water levels.')
+
+    subset_ds = xarray.Dataset(
+        {'zeta': (('time', 'node'), zeta, ds['zeta'].attrs)},
+        coords={'time': ds['time'].values,
+                'x': ('node', x[node_idx]),
+                'y': ('node', y[node_idx])},
+    )
+
+    if convert_to_local_msl:
+        logger.info('Opening LMSL dataset...')
+        s3 = s3fs.S3FileSystem(anon=True)
+        ds_lmsl = xarray.open_dataset(s3.open(f's3://{LMSL_PATH}', 'rb'))
+        if ds_lmsl.sizes['node'] != ds.sizes['node']:
+            raise ValueError(
+                f"LMSL file has {ds_lmsl.sizes['node']} nodes but the forecast mesh has "
+                f"{ds.sizes['node']}: the meshes differ, so LMSL cannot be subtracted."
+            )
+        logger.info('Loading LMSL for nodes in the box...')
+        lmsl_sub = ds_lmsl.isel(node=node_idx).load()
+        if not (numpy.allclose(lmsl_sub['x'].values, x[node_idx]) and
+                numpy.allclose(lmsl_sub['y'].values, y[node_idx])):
+            raise ValueError('LMSL node coordinates differ from the forecast mesh.')
+        logger.info('Subtracting LMSL...')
+        subset_ds['zeta'] = subset_ds['zeta'] - xarray.DataArray(
+            lmsl_sub['mean_sea_level'].values, dims=['node']
+        )
+
+    logger.info('Renaming x and y coordinates to match thalassa.')
+    return subset_ds.rename({'x':'lon', 'y':'lat'})
+
+
+def _load_forecast_xsg(ds: xarray.Dataset, bbox: shapely.box,
+                       convert_to_local_msl: bool) -> xarray.Dataset:
+    """Subset and load forecast with xarray-subset-grid (original method).
+
+    Can be slow (~5-15 minutes): every chunk of zeta that overlaps the
+    box is downloaded in full, for every time step.
+    """
     logger.info('Assigning grid topology...')
     ds = xarray_subset_grid.grids.ugrid.assign_ugrid_topology(ds)
     logger.info('Finished assigning grid topology.')
 
-    # Subset to box. 
+    # Subset to box.
     logger.info('Subsetting...')
     subset_ds = ds.xsg.subset_polygon(shapely.get_coordinates(bbox))
     logger.info('Finished subsetting.')
@@ -124,7 +376,7 @@ def load_forecast_ds(init_datetime: datetime.datetime,
 
     # Optionally convert to local mean sea level.
     if convert_to_local_msl:
-        lmsl_filename = 'noaa-nos-stofs2d-pds/_archive/msl_2017-2019_avg/GSTOFSv5.6.5_msl_2017-2019_avg_20241619.nc'
+        lmsl_filename = LMSL_PATH
         logger.info('Opening LMSL dataset...')
         s3 = s3fs.S3FileSystem(anon=True)
         ds_lmsl = xarray.open_dataset(
@@ -260,16 +512,22 @@ def ds_add_datum(ds: xarray.Dataset,
     z_ll = -1.0 * numpy.where(~numpy.isinf(z_new), z_new, numpy.nan)
     
     # Add to copy of dataset.
+    # Use the spatial dimension(s) of the latitude variable rather than
+    # assuming 'node': after selecting nearest nodes for image points
+    # (ds.sel(node=inds)), the spatial dimension is 'station'. Hardcoding
+    # 'node' there made the new datum broadcast against the existing
+    # variables into a 2D (station, node) array.
+    spatial_dims = list(ds[ds_y_name].dims)
     ds_out = ds.copy()
     new_var_name = '_'.join([target_datum, 'minus', base_datum])
     if incl_time_axis:
         ds_out[new_var_name] = xarray.DataArray(
-            numpy.tile(z_ll, (len(ds.time), 1)),
-            dims=['time', 'node']
+            numpy.tile(z_ll, (len(ds.time),) + (1,) * z_ll.ndim),
+            dims=['time'] + spatial_dims
         )
         return ds_out
     else:
-        ds_out[new_var_name] = xarray.DataArray(z_ll, dims=['node'])
+        ds_out[new_var_name] = xarray.DataArray(z_ll, dims=spatial_dims)
         return ds_out
 
 

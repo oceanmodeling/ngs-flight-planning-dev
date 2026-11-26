@@ -191,7 +191,8 @@ webencodings==0.5.1
 websocket-client==1.8.0
 wrapt==1.17.2
 xarray==2025.1.1
-xarray_subset_grid @ git+https://github.com/asascience-open/xarray-subset-grid.git
+# Pinned: later commits fail to import on Python 3.11/3.12 (see README).
+xarray_subset_grid @ git+https://github.com/asascience-open/xarray-subset-grid.git@f96a90bd0becdfa6e4785ce79f835a97abb4d06e
 xyzservices==2025.1.0
 yarl==1.18.3
 zarr==3.0.1

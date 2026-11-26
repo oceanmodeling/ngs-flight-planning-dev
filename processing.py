@@ -8,6 +8,7 @@ calc_sun_alt
 calc_in_range
 point_windows_from_bool
 line_windows_from_bool
+explain_missing_windows
 
 """
 
@@ -90,11 +91,13 @@ def point_table_from_lines(df_lines: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 def interp_time(ds: xarray.Dataset, 
                 timestep_seconds: int = 60) -> xarray.Dataset:
     """Interpolate dataset along time axis, with specified output frequency."""
-    time_interp = numpy.arange(ds.time.min().data, 
-                               ds.time.max().data 
-                               + numpy.timedelta64(1, 's'), 
-                               numpy.timedelta64(timestep_seconds, 's'), 
-                               dtype='datetime64[ns]')
+    # The new time axis must use the same unit as ds.time (e.g., ns or us):
+    # with a different unit, xarray returns NaN at every new time step.
+    time_interp = numpy.arange(ds.time.min().data,
+                               ds.time.max().data
+                               + numpy.timedelta64(1, 's'),
+                               numpy.timedelta64(timestep_seconds, 's'),
+                               dtype=ds.time.dtype)
     return ds.interp(time=time_interp, method='linear')
 
 
@@ -370,3 +373,99 @@ def line_windows_from_bool(df: pandas.DataFrame,
             
             
 
+def explain_missing_windows(
+    df: pandas.DataFrame,
+    df_point_windows: pandas.DataFrame,
+    df_line_windows: pandas.DataFrame,
+    datums: list,
+    min_solar_elevation: float,
+    point_step: int = 1,
+    base_datum: str = 'lmsl',
+    z_var: str = 'zeta'
+) -> list:
+    """Explain, in plain language, why datums have no line time windows.
+
+    Checks the water level and sun conditions separately, so the
+    user can tell which requirement was never met.
+
+    Parameters
+    ----------
+    df
+        The per-point, per-time data frame after `calc_in_range`
+        (index levels ['station', 'time']).
+    df_point_windows
+        Output of `point_windows_from_bool`.
+    df_line_windows
+        Output of `line_windows_from_bool`.
+    datums
+        The datums requested.
+    min_solar_elevation
+        The minimum solar elevation used, in degrees.
+    point_step
+        The every_nth_point setting used for line windows.
+    base_datum
+        The datum relative to which the other datums are specified.
+    z_var
+        The name of the water level variable.
+
+    Returns
+    -------
+    List of messages, one per datum with no line windows at all
+    (or a single message if the sun is the reason for every datum).
+    Empty if every datum has at least one line window.
+
+    """
+    def has_windows(windows, dat):
+        return (not windows.empty) and (windows['datum'] == dat).any()
+
+    missing = [d for d in datums if not has_windows(df_line_windows, d)]
+    if not missing:
+        return []
+
+    times = df.index.get_level_values('time')
+    period = (f"{times.min().strftime('%Y-%m-%d %H:%M')} to "
+              f"{times.max().strftime('%Y-%m-%d %H:%M')} UTC")
+    sun_ok = df['solar_elevation'] >= min_solar_elevation
+    max_sun = df['solar_elevation'].max()
+    if not sun_ok.any():
+        return [
+            f"No time windows for {', '.join(d.upper() for d in missing)}: the sun never "
+            f"reaches the minimum solar elevation of {min_solar_elevation:g} degrees at "
+            f"these flight lines during the forecast ({period}). The highest it gets is "
+            f"{max_sun:.1f} degrees. Use a later forecast or, if acceptable, a lower "
+            f"--min_solar_elevation."
+        ]
+
+    messages = []
+    for dat in missing:
+        if dat == 'bmhw':
+            mhw = df['mhw_minus_' + base_datum]
+            water_ok = df[z_var] <= mhw
+            closest = (df[z_var] - mhw).min()
+            water_desc = 'at or below MHW'
+            miss_desc = f'it stays at least {closest:.2f} m above MHW'
+        else:
+            level = df['_'.join([dat, 'minus', base_datum])]
+            off = (df[z_var] - level).abs() - df['tolerance']
+            water_ok = off <= 0
+            water_desc = f'within tolerance of {dat.upper()}'
+            miss_desc = (f'it stays at least {off.min():.2f} m outside the tolerance '
+                         f'band (tolerance {df["tolerance"].min():.2f}-'
+                         f'{df["tolerance"].max():.2f} m)')
+        if not water_ok.any():
+            msg = (f"No time windows for {dat.upper()}: the forecast water level is never "
+                   f"{water_desc} at any photo point during the forecast ({period}); "
+                   f"{miss_desc}.")
+        elif not (water_ok & sun_ok).any():
+            msg = (f"No time windows for {dat.upper()}: the water level is {water_desc} "
+                   f"only when the sun is below {min_solar_elevation:g} degrees "
+                   f"(forecast {period}).")
+        elif has_windows(df_point_windows, dat):
+            msg = (f"No time windows for {dat.upper()}: individual photo points have "
+                   f"windows, but never all the points on any one line at the same time "
+                   f"(points checked per line: every_nth_point={point_step}). Checking "
+                   f"fewer points per line (e.g., --every_nth_point 0) is less strict.")
+        else:
+            msg = f"No time windows for {dat.upper()} during the forecast ({period})."
+        messages.append(msg)
+    return messages

@@ -120,9 +120,11 @@ def main(
     
     logger.info('Adding datums...')
     # Get list of datums to add.
-    # We want all in `datums`, except BMHW, plus MLW and MHW to calculate range.
+    # We want all in `datums`, except BMHW, plus MHW, MLW and MLLW to calculate
+    # range (MHW - MLW, or MHW - MLLW for West Coast/Alaska). Adding them here,
+    # on the full mesh, means ds_add_tidal_range never has to add one later.
     datums_to_add = [d for d in datums if d != 'bmhw']
-    for datum in list(set(datums_to_add + ['mhw', 'mlw'])):
+    for datum in list(set(datums_to_add + ['mhw', 'mlw', 'mllw'])):
         ds_mesh = mesh_handling.ds_add_datum(ds_mesh, datum)
     logger.info('Finished adding datums...')
     
@@ -208,6 +210,15 @@ def main(
     )
     logger.info('Finished calculating windows by line.')
 
+    # Explain any datums with no windows at all, so it's clear to the
+    # user why (sun too low, water never in range, or no line-wide overlap).
+    notes = processing.explain_missing_windows(
+        df_interp, df_point_windows, df_line_windows, datums,
+        min_solar_elevation, point_step=every_nth_point
+    )
+    for note in notes:
+        logger.warning(note)
+
     logger.warning(f'Converting times to {output_time_zone}...')
     logger.warning('ATTENTION: Take care when using time information in GIS software. Geopackage (.gpkg) files may contain timezone information, but shapefiles (.shp) do not.')
     logger.debug('Before conversion:')
@@ -225,7 +236,7 @@ def main(
     outputs.output_all_prediction(df_lines, df_line_windows, 
                                   df_points, df_point_windows, 
                                   project_name, datums, init_datetime,
-                                  save_dir)
+                                  save_dir, notes=notes)
     return df_point_windows, df_line_windows
 
 
