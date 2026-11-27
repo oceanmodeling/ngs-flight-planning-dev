@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NGS flight planning</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/deck.gl@9.0.38/dist.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="title">
+      <strong>NGS flight planning</strong>
+      <span id="run-title" class="muted"></span>
+    </div>
+    <label class="button" id="open-file">Open results…
+      <input type="file" id="file-input" accept=".json,application/json" hidden>
+    </label>
+  </header>
+
+  <main>
+    <section id="map-wrap">
+      <div id="map"></div>
+      <div id="map-legend" class="legend" hidden></div>
+      <div id="mesh-bar" class="mesh-bar" hidden>
+        <button type="button" id="mesh-play" title="Play / pause">▶</button>
+        <input type="range" id="mesh-slider" min="0" max="0" step="1" value="0">
+        <span id="mesh-time" class="mesh-time"></span>
+      </div>
+      <div id="empty" class="empty">
+        <h2>Open a results file</h2>
+        <p>Choose <b>Open results…</b> or drop a <code>.gui.json</code> file here.
+           <code>predict.py</code> writes it next to its other outputs.
+           Or start the app with <code>python app.py</code> to run and view in one place.</p>
+        <p id="load-error" class="error" hidden></p>
+      </div>
+    </section>
+
+    <aside id="side">
+      <nav class="tabs" id="tabs" hidden>
+        <button type="button" data-tab="run" class="active">New run</button>
+        <button type="button" data-tab="results" id="tab-results" disabled>Results</button>
+      </nav>
+
+      <div id="run-panel" hidden>
+        <form id="run-form" autocomplete="off">
+          <label class="field">Flight lines
+            <select id="f-lines"></select>
+          </label>
+          <div id="upload-row" class="field" hidden>
+            <input type="file" id="f-upload" accept=".wpt,.txt,.csv">
+            <span id="upload-msg" class="hint"></span>
+          </div>
+          <label class="field">Project name
+            <input id="f-project" type="text" required>
+          </label>
+          <label class="field">STOFS forecast
+            <select id="f-forecast"><option>Checking NOAA for forecasts…</option></select>
+          </label>
+          <div class="field">Datums
+            <div id="f-datums" class="checks"></div>
+          </div>
+          <label class="field">Minimum sun elevation (°)
+            <input id="f-sun" type="number" value="25" min="0" max="90" step="1">
+          </label>
+          <details class="more">
+            <summary>More options</summary>
+            <label class="field">Photo points checked per line
+              <select id="f-nth">
+                <option value="1">All points</option>
+                <option value="0">First and last only</option>
+                <option value="2">Every 2nd point</option>
+                <option value="5">Every 5th point</option>
+              </select>
+            </label>
+            <label class="field">Time zone for results
+              <select id="f-tz">
+                <option>UTC</option><option>US/Eastern</option><option>US/Central</option>
+                <option>US/Mountain</option><option>US/Pacific</option><option>US/Alaska</option>
+                <option>US/Hawaii</option>
+              </select>
+            </label>
+          </details>
+          <button type="submit" id="f-run" class="primary">Run</button>
+          <p id="form-error" class="error" hidden></p>
+        </form>
+
+        <div id="progress" hidden>
+          <div class="prog-head"><b id="prog-title"></b><span id="prog-time" class="muted"></span></div>
+          <ol id="prog-stages"></ol>
+          <p id="prog-error" class="error" hidden></p>
+          <button type="button" id="prog-cancel">Cancel run</button>
+          <details><summary>Log</summary><pre id="prog-log"></pre></details>
+        </div>
+
+        <h4>Past runs</h4>
+        <ul id="past-runs" class="past-runs"><li class="hint">None yet.</li></ul>
+      </div>
+
+      <div id="results-panel"></div>
+    </aside>
+  </main>
+
+  <script src="geometry.js"></script>
+  <script src="planner.js"></script>
+  <script src="photo.js"></script>
+  <script src="mesh.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

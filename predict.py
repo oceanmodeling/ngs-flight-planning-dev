@@ -124,6 +124,10 @@ def main(
         init_datetime, bbox, convert_to_local_msl=True, mesh_cache=mesh_cache
     )
     logger.info('Finished loading forecast subset.')
+    # Mesh triangles (for the results viewer's mesh view) travel with the
+    # forecast subset; set them aside so they don't enter the calculations.
+    mesh_tri = ds_mesh['mesh_tri'].values if 'mesh_tri' in ds_mesh else None
+    ds_mesh = ds_mesh.drop_vars([v for v in ('mesh_tri', 'global_node') if v in ds_mesh.variables])
     
     logger.info('Adding datums...')
     # Get list of datums to add.
@@ -134,6 +138,7 @@ def main(
     for datum in list(set(datums_to_add + ['mhw', 'mlw', 'mllw'])):
         ds_mesh = mesh_handling.ds_add_datum(ds_mesh, datum)
     logger.info('Finished adding datums...')
+    ds_mesh_levels = ds_mesh   # water levels and datums at every mesh node, for the mesh view
     
     logger.info('Dropping NaN data...')
     # For window calculations, we need a time series with no missing data,
@@ -244,6 +249,22 @@ def main(
                                   df_points, df_point_windows, 
                                   project_name, datums, init_datetime,
                                   save_dir, notes=notes)
+    # Data file for the results viewer (viewer/index.html). A failure here
+    # must not lose the main outputs, which are already written.
+    try:
+        outputs.gui_json_prediction(
+            df_lines, df_points, ds_points_model_timeseries,
+            df_line_windows, df_point_windows, project_name, datums,
+            init_datetime, bbox, min_solar_elevation, every_nth_point,
+            output_time_zone, notes, save_dir
+        )
+    except Exception as e:
+        logger.error(f'Could not write results viewer data: {e}', exc_info=True)
+    try:
+        outputs.mesh_levels_prediction(ds_mesh_levels, mesh_tri, datums, project_name,
+                                       init_datetime, save_dir)
+    except Exception as e:
+        logger.error(f'Could not write mesh water levels for the viewer: {e}', exc_info=True)
     return df_point_windows, df_line_windows
 
 

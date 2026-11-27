@@ -17,6 +17,8 @@ html_qc
 geopackage_qc
 shapefile_qc
 geojson_qc
+gui_json_prediction
+mesh_levels_prediction
 convert_output_z_units
 get_output_z_units
 
@@ -1496,3 +1498,245 @@ for ext in ['csv', 'shp', 'geojson', 'gpkg']:
 ...             pass
 """
 
+
+
+def gui_json_prediction(
+    df_lines: gpd.GeoDataFrame,
+    df_points: gpd.GeoDataFrame,
+    ds_points,
+    df_line_windows: pd.DataFrame,
+    df_point_windows: pd.DataFrame,
+    project_name: str,
+    datum_list: List[str],
+    init_datetime: datetime.datetime,
+    bbox,
+    min_solar_elevation: float,
+    every_nth_point: int,
+    output_time_zone: str,
+    notes: List[str] | None,
+    outdir: str | pathlib.Path
+) -> pathlib.Path:
+    """Write one JSON file with everything the results viewer needs.
+
+    Contents: run settings, flight lines, photo points with their matched
+    model nodes, hourly forecast water level, datum level and tolerance
+    per point, hourly solar elevation per point, line and point time
+    windows, and any notes explaining missing windows.
+
+    Parameters
+    ----------
+    df_lines, df_points
+        Flight lines and photo points (as used by predict.main).
+    ds_points
+        Model time series at the nearest node to each photo point
+        (dims station, time), with datum, tolerance, lat and lon variables.
+    df_line_windows, df_point_windows
+        Time windows by line and by point (times timezone-aware).
+    project_name, datum_list, init_datetime
+        Used in the filename and stored as run settings.
+    bbox
+        The forecast subsetting box (shapely geometry).
+    min_solar_elevation, every_nth_point, output_time_zone
+        Run settings, stored for display.
+    notes
+        Messages explaining datums without windows.
+    outdir
+        The directory in which to save the file.
+
+    Returns
+    -------
+    Path of the written file.
+
+    """
+    import json
+    import pvlib
+
+    def num(a, nd):
+        a = np.round(np.asarray(a, dtype='float64'), nd)
+        return [None if np.isnan(v) else float(v) for v in a.ravel()]
+
+    def iso(t):
+        return pd.Timestamp(t).isoformat()
+
+    ds = ds_points.transpose('station', 'time')
+    times = pd.DatetimeIndex(ds['time'].values).tz_localize('UTC')
+    n_st = ds.sizes['station']
+    node_lat = ds['lat'].values
+    node_lon = ds['lon'].values
+
+    # Hourly solar elevation at each photo point.
+    lat_rep = np.repeat(df_points['LAT'].values, len(times))
+    lon_rep = np.repeat(df_points['LON'].values, len(times))
+    t_rep = times.repeat(1).tolist() * n_st
+    sol = pvlib.solarposition.get_solarposition(
+        pd.DatetimeIndex(t_rep), lat_rep, lon_rep
+    )['elevation'].values.reshape(n_st, len(times))
+
+    # Distance from each photo point to its model node (m).
+    r = 6371000.0
+    p1, p2 = np.radians(df_points['LAT'].values), np.radians(node_lat)
+    dphi = p2 - p1
+    dlmb = np.radians(node_lon - df_points['LON'].values)
+    a = np.sin(dphi / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlmb / 2) ** 2
+    dist = 2 * r * np.arcsin(np.sqrt(a))
+
+    datums = {}
+    for dat in datum_list:
+        if dat == 'bmhw':
+            datums[dat] = {'mode': 'below', 'level': num(ds['mhw_minus_lmsl'].values, 3)}
+        else:
+            datums[dat] = {'mode': 'band', 'level': num(ds[f'{dat}_minus_lmsl'].values, 3)}
+
+    data = {
+        'format': 'ngs-flight-planning-gui',
+        'version': 1,
+        'kind': 'prediction',
+        'project': project_name,
+        'forecast_init': pd.Timestamp(init_datetime).tz_localize('UTC').isoformat(),
+        'created': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        'settings': {
+            'datums': list(datum_list),
+            'min_solar_elevation': float(min_solar_elevation),
+            'every_nth_point': int(every_nth_point),
+            'output_time_zone': output_time_zone,
+        },
+        'bbox': [float(v) for v in bbox.bounds],
+        'notes': list(notes or []),
+        'times': [t.isoformat() for t in times],
+        'lines': [
+            {'line': str(r_.LINE), 'photos': int(r_.PHOTOS),
+             'coords': [[round(x, 6), round(y, 6)] for x, y in r_.geometry.coords],
+             # Every column of the flight-lines file, for the line's popup.
+             'attrs': {str(k): (None if pd.isna(v) else str(v)) for k, v in attrs.items()}}
+            for r_, attrs in zip(df_lines.itertuples(),
+                                 pd.DataFrame(df_lines.drop(columns='geometry')).to_dict('records'))
+        ],
+        'points': {
+            'line': [str(v) for v in df_points['LINE'].values],
+            'point_num': [int(v) for v in df_points['POINT_NUM'].values],
+            'lat': num(df_points['LAT'].values, 6),
+            'lon': num(df_points['LON'].values, 6),
+            'node_lat': num(node_lat, 6),
+            'node_lon': num(node_lon, 6),
+            'node_dist_m': num(dist, 1),
+            'tolerance': num(ds['tolerance'].values, 3),
+            'zeta': [num(row, 3) for row in ds['zeta'].values],
+            'sun': [num(row, 1) for row in sol],
+        },
+        'datums': datums,
+        'line_windows': [
+            {'line': str(w.line), 'datum': str(w.datum),
+             'start': iso(w.start_time), 'end': iso(w.end_time)}
+            for w in df_line_windows.itertuples()
+        ] if not df_line_windows.empty else [],
+        'point_windows': [
+            {'station': int(w.station), 'datum': str(w.datum),
+             'start': iso(w.start_time), 'end': iso(w.end_time)}
+            for w in df_point_windows.itertuples()
+        ] if not df_point_windows.empty else [],
+    }
+    datestr = init_datetime.strftime('%Y%m%dT%H')
+    filename = '_'.join([project_name, '_'.join(datum_list), datestr]) + '.gui.json'
+    path = pathlib.Path(outdir) / filename
+    path.write_text(json.dumps(data, separators=(',', ':')))
+    logger.info(f'Saved results viewer data: {path.name} '
+                f'({path.stat().st_size / 1e6:.1f} MB).')
+    return path
+
+
+def mesh_levels_prediction(
+    ds_mesh,
+    triangles,
+    datum_list: List[str],
+    project_name: str,
+    init_datetime: datetime.datetime,
+    outdir: str | pathlib.Path
+) -> pathlib.Path:
+    """Write forecast water levels on the mesh, for the results viewer.
+
+    Binary file <name>.mesh.bin:
+      'NGSM' | uint32 header length | JSON header (padded to 4 bytes) | data
+    The header gives the sizes, times, datum names and byte offsets (from the
+    start of the data) of: lon, lat (float32 per node), tri (uint32, 3 per
+    triangle), one int16 array per datum (datum height above LMSL, cm), and
+    zeta (int16, cm above LMSL, [time][node]). Missing values are -32768.
+
+    Parameters
+    ----------
+    ds_mesh
+        Forecast subset with zeta (time, node), lon, lat and the datum
+        variables (<datum>_minus_lmsl) added by mesh_handling.ds_add_datum.
+    triangles
+        (n, 3) node indices of the mesh triangles, or None to use a Delaunay
+        triangulation of the nodes instead (marked as approximate).
+    datum_list, project_name, init_datetime
+        Used for the datums included and the filename.
+    outdir
+        The directory in which to save the file.
+
+    Returns
+    -------
+    Path of the written file.
+
+    """
+    import json
+    NODATA = -32768
+    lon = ds_mesh['lon'].values.astype('float32')
+    lat = ds_mesh['lat'].values.astype('float32')
+    n = len(lon)
+
+    triangulation = 'stofs'
+    if triangles is None or len(triangles) == 0:
+        from scipy.spatial import Delaunay
+        xy = np.column_stack([lon * np.cos(np.deg2rad(lat.mean())), lat])
+        tri = Delaunay(xy).simplices
+        # Drop long, thin triangles that span land between separate waters.
+        e = np.stack([np.linalg.norm(xy[tri[:, i]] - xy[tri[:, (i + 1) % 3]], axis=1) for i in range(3)], axis=1).max(axis=1)
+        triangles = tri[e < 4 * np.median(e)]
+        triangulation = 'delaunay'
+    triangles = np.asarray(triangles, dtype='uint32')
+
+    def cm(a):
+        a = np.asarray(a, dtype='float64') * 100.0
+        out = np.where(np.isfinite(a), np.clip(np.round(a), -32767, 32767), NODATA)
+        return out.astype('<i2')
+
+    datums = []
+    for d in datum_list:
+        name = 'mhw' if d == 'bmhw' else d
+        var = f'{name}_minus_lmsl'
+        if var in ds_mesh and name not in datums:
+            datums.append(name)
+    zeta = ds_mesh['zeta'].transpose('time', 'node').values
+    times = [pd.Timestamp(t).tz_localize('UTC').isoformat() for t in ds_mesh['time'].values]
+
+    blocks, offsets, pos = [], {}, 0
+    def add(name, arr):
+        nonlocal pos
+        b = np.ascontiguousarray(arr).tobytes()
+        pad = (-len(b)) % 4
+        offsets[name] = pos
+        blocks.append(b + b'\x00' * pad)
+        pos += len(b) + pad
+    add('lon', lon.astype('<f4')); add('lat', lat.astype('<f4'))
+    add('tri', triangles.astype('<u4'))
+    for d in datums:
+        add(f'datum:{d}', cm(ds_mesh[f'{d}_minus_lmsl'].values))
+    add('zeta', cm(zeta))
+    header = {
+        'format': 'ngs-flight-planning-mesh', 'version': 1, 'project': project_name,
+        'nodes': n, 'triangles': int(len(triangles)), 'times': times, 'datums': datums,
+        'units': 'cm', 'reference': 'LMSL', 'nodata': NODATA, 'triangulation': triangulation,
+        'offsets': offsets,
+    }
+    hb = json.dumps(header).encode()
+    hb += b' ' * ((-len(hb)) % 4)
+    datestr = init_datetime.strftime('%Y%m%dT%H')
+    path = pathlib.Path(outdir) / ('_'.join([project_name, '_'.join(datum_list), datestr]) + '.mesh.bin')
+    with open(path, 'wb') as f:
+        f.write(b'NGSM'); f.write(np.uint32(len(hb)).tobytes()); f.write(hb)
+        for b in blocks:
+            f.write(b)
+    logger.info(f'Saved mesh water levels for the viewer: {path.name} '
+                f'({n} nodes, {len(triangles)} triangles, {triangulation}; {path.stat().st_size / 1e6:.1f} MB).')
+    return path

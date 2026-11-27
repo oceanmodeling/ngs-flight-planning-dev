@@ -375,8 +375,75 @@ def _load_forecast_byte_ranges(store, ds: xarray.Dataset, vds, layout: dict,
         logger.info('Subtracting LMSL...')
         subset_ds['zeta'] = subset_ds['zeta'] - xarray.DataArray(lmsl, dims=['node'])
 
+    # Mesh triangles inside the box, for the results viewer's mesh view.
+    # Stored as extra variables that predict.py removes before processing.
+    try:
+        tri = _triangles_in_box(store, ds, vds, node_idx, cache_entry)
+        if tri is not None:
+            subset_ds['mesh_tri'] = (('mesh_face', 'corner'), tri)
+    except Exception as e:
+        logger.warning(f'Could not load mesh triangles ({e!r}); the mesh view will use an approximate triangulation.')
+    subset_ds['global_node'] = ('node', node_idx)
+
     logger.info('Renaming x and y coordinates to match thalassa.')
     return subset_ds.rename({'x':'lon', 'y':'lat'})
+
+
+def _triangles_in_box(store, ds: xarray.Dataset, vds, node_idx: numpy.ndarray,
+                      cache_entry: pathlib.Path | None) -> numpy.ndarray | None:
+    """Mesh triangles with all three corners among node_idx, as local indices.
+
+    The global triangle list (~300 MB) is downloaded once per mesh and kept
+    in the mesh cache. Without the cache it is not downloaded (too large to
+    fetch on every run) and None is returned.
+    """
+    if cache_entry is None:
+        logger.info('Mesh cache disabled: mesh triangles not loaded.')
+        return None
+    n_node = int(ds.sizes['node'])
+    path = cache_entry / 'element.npy'
+    layout = _raw_chunk_layout(vds, 'element')
+    elements = None
+    if path.exists():
+        elements = numpy.load(path, mmap_mode='r')
+        # Spot-check the cached triangles against the forecast file.
+        if isinstance(layout, dict) and elements.shape == tuple(layout['shape']):
+            ok = all(_elements_match(store, layout, elements, rows) for rows in
+                     (slice(0, 50), slice(elements.shape[0] // 2, elements.shape[0] // 2 + 50),
+                      slice(elements.shape[0] - 50, elements.shape[0])))
+            if not ok:
+                logger.warning('Cached mesh triangles differ from the forecast file: downloading them again.')
+                elements = None
+        else:
+            elements = None
+    if elements is None:
+        logger.info('Downloading mesh triangles once for the mesh cache (~300 MB)...')
+        start = int(ds['element'].attrs.get('start_index', 1))
+        elements = (ds['element'].values - start).astype('int32')
+        _save_cache_files(cache_entry, {'element.npy': elements}, 'element.json',
+                          {'start_index_removed': start, 'shape': list(elements.shape),
+                           'created': datetime.datetime.now(datetime.timezone.utc).isoformat()})
+        elements = numpy.load(path, mmap_mode='r')
+    inbox = numpy.zeros(n_node, dtype=bool)
+    inbox[node_idx] = True
+    el = numpy.asarray(elements)
+    keep = inbox[el[:, 0]] & inbox[el[:, 1]] & inbox[el[:, 2]]
+    local = numpy.full(n_node, -1, dtype='int64')
+    local[node_idx] = numpy.arange(len(node_idx))
+    tri = local[el[keep]].astype('int32')
+    logger.info(f'{len(tri)} mesh triangles inside the box.')
+    return tri
+
+
+def _elements_match(store, layout: dict, cached: numpy.ndarray, rows: slice) -> bool:
+    """Compare cached triangles (0-based) with the file (1-based) for some rows."""
+    item = layout['dtype'].itemsize
+    path, offset = layout['chunks'][(0, 0)]
+    key = path.split('://', 1)[-1].split('/', 1)[1]
+    start = offset + rows.start * 3 * item
+    raw = numpy.frombuffer(obstore.get_range(store, key, start=start, end=start + (rows.stop - rows.start) * 3 * item),
+                           dtype=layout['dtype']).reshape(-1, 3)
+    return numpy.array_equal(raw - 1, numpy.asarray(cached[rows]))
 
 
 # ---------------------------------------------------------------------------

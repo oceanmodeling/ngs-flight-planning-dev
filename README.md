@@ -56,6 +56,8 @@ Installing packages from GitHub requires `git`. On macOS, if `git` stops with an
 # Usage
 Eventually, the aim is to use the package for long-term (months ahead) flight planning, near-term (days ahead) flight planning, and post flight QC (preliminary and final). Presently, the near-term flight planning and both QC modes have been implemeted. These are run using python command line scripts. The process should output the same types of files as the existing TCARI method. 
 
+The easiest way to run flight planning and look at the results is the visualization app: run `python app.py` (see "Visualization app" below). The command line scripts below do the same calculations and write the same files.
+
 ## Flight planning
 Run the script `predict.py`, with three required command line arguments:
 ```
@@ -76,7 +78,9 @@ AL2401_mllw_mhw_20250101T12.gpkg           AL2401_mllw_mhw_20250101T12.lines.shx
 AL2401_mllw_mhw_20250101T12.lines.cpg      AL2401_mllw_mhw_20250101T12.lines.txt  AL2401_mllw_mhw_20250101T12.pts.shx
 AL2401_mllw_mhw_20250101T12.lines.dbf      AL2401_mllw_mhw_20250101T12.pts.cpg
 AL2401_mllw_mhw_20250101T12.lines.geojson  AL2401_mllw_mhw_20250101T12.pts.dbf
+AL2401_mllw_mhw_20250101T12.gui.json      AL2401_mllw_mhw_20250101T12.mesh.bin
 ```
+The `.gui.json` and `.mesh.bin` files are for the visualization app: the first holds the lines, photo points, windows, sun and camera data, and the second (about 24 MB for AL2401) the forecast water levels on the model mesh (see "Visualization app" below).
 
 ## QC
 Run the script `qc.py`, with two required command line arguments:
@@ -117,16 +121,108 @@ When the STOFS forecast file stores water levels uncompressed, the scripts read 
 - **Extra checks.**
   - The coordinates of every node the run actually uses are compared with the forecast file. If any differ, the entry is downloaded again and replaced.
   - The cached LMSL is used only if the LMSL file on S3 is unchanged (same ETag).
+- **Mesh triangles.** The visualization app's mesh view also needs the mesh's triangle list (about 300 MB for the global mesh). It is downloaded once per mesh into the same cache entry (`element.npy`) and spot-checked against the forecast file on later runs.
 - **Clearing the cache.** It is safe to delete the cache folder at any time; it is rebuilt on the next run. The first run on a new mesh takes longer, because it downloads the full coordinate and LMSL fields once.
+
+# Visualization app
+A local web app to run flight planning and explore the results on a map: which lines can be flown when, a suggested flight plan, a simulated photo for any photo point, and the STOFS forecast water levels on the model mesh.
+
+## Starting the app
+From the repository folder, in the project's Python environment:
+```
+python app.py
+```
+Your web browser opens on the app (at <http://localhost:8050> by default). Close it with Ctrl+C in the terminal. Options: `--port <n>` to use another port, `--no-browser` to not open a browser window.
+
+The app uses only the Python standard library; there is nothing extra to install. The page loads deck.gl, MapLibre, the basemap and the satellite imagery from the web, so it needs an internet connection (as do the forecasts). After the app is updated, reload its browser tab (Cmd+Shift+R or Ctrl+Shift+R) to get the new version.
+
+## Running a calculation (New run tab)
+1. **Flight lines:** pick a file from `data/` (any `.wpt`, `.txt` or `.csv` flight-lines file with the `LINE`, `LAT1`, `LON1`, `LAT2`, `LON2` and `PHOTOS` columns), or upload one, or drop it on the page. Its lines are drawn on the map straight away. Click a line to see every column of its row.
+2. **STOFS forecast:** the runs from the last four days that are on NOAA's archive; the latest is selected. (For older forecasts, run `predict.py` directly.)
+3. **Datums**, **minimum sun elevation**, and under **More options** the photo points checked per line and the time zone for the results.
+4. Press **Run**. The steps tick off as it works, usually one to two minutes, with a Cancel button and the log. When it finishes, the results open.
+
+Each run is kept in its own folder under `runs/` (ignored by git), with the same output files as `predict.py` plus the run's log. **Past runs** are listed under the form; click one to open its results again.
+
+## Results tab
+- **Flight plans.** The lines are scheduled into flights (`viewer/planner.js`). Each line is flown entirely inside one of its time windows, in either direction; the time to fly each line, the transit and turn between lines, and a maximum flight length are taken into account, with one flight per day. Four plans are offered:
+  - **Finish soonest:** fly every day there are windows.
+  - **Fewest flights:** cover the most lines per flight.
+  - **Best value:** the fewest total hours for the lines covered, counting time on site and an overhead per flight (getting to and from the site, take-off and landing). It may leave out lines that would need a flight of their own.
+  - **Best single flight:** the most lines in one flight.
+
+  The **recommended** plan covers every line that has a window in the fewest total hours. Each plan lists its flights with times and the order of lines; click a flight to show only that flight. On the map, planned lines are coloured by flight, numbered in flying order, with an arrow showing the direction each line is flown and the transits between lines. The map stays north-up.
+- **Planning assumptions:** ground speed (default 180 kt), time per turn or line change (4 min), longest flight on site (4 h), overhead per flight (1 h) and longest wait for a window (60 min). Plans update as you type, and a message says whether the recommended plan changed. **Reset to defaults** restores them.
+- **Photo preview.** Click any white photo point to see a simulated photo at the time it would be taken in the selected plan (`viewer/photo.js`, `viewer/geometry.js`):
+  - Esri World Imagery cut to the photo's exact ground footprint and turned so the flight direction is up, as the camera sees it. The camera geometry comes from the flight-lines file: flying height = focal length × scale, footprint = image format × scale (3.34 × 2.50 km from 3,200 m for AL2401).
+  - Lighting for the sun at that moment: dimmer, warmer and hazier when the sun is low. A compass shows north and the sun's direction.
+  - Sun glint on water only (water outlines from the basemap), with its strength from the Cox–Munk wave-slope model for a light breeze (5 m/s). Glint enters the frame only when the sun is high, above about 69° for the AL2401 camera.
+  - The sun's elevation and direction, the glint verdict, shadow direction and length, and the footprint are listed under the image. The sun position is computed in the browser and agrees with `predict.py`'s pvlib values to within 0.15°.
+
+  The preview is an illustration: the satellite image has its own sun, shadows, tide and season, and clouds and waves are not modelled.
+- **STOFS water levels on the mesh** (under **Map view**, off by default). The forecast water level on every STOFS model triangle in the survey area, coloured blue below and orange above the chosen reference (local mean sea level or one of the run's datums), with the mesh edges (can be turned off). A time bar on the map steps through the forecast hour by hour, with play/pause. Hover over a triangle to read its water level. Dry areas are not shown.
+- **Lines.** Every line with its first window, number of windows and place in the plan (flight · order). Click a line to select it; clicking a line on the map also opens a popup with every column of its flight-lines file row.
+- Notes explaining datums with no windows (for example, sun too low) are shown at the top. Switch datum with the buttons at the top of the Results panel.
+
+## Viewing results without the app
+The page in `viewer/` can also show results from `predict.py` runs made on the command line. Start a plain web server in the repository folder:
+```
+python -m http.server 8000
+```
+then open <http://localhost:8000/viewer/> and choose **Open results…**, or drop a `.gui.json` file onto the page. To include the mesh view, open the file through a `data` link instead, so the page can find the `.mesh.bin` file next to it, for example:
+```
+http://localhost:8000/viewer/?data=../data/testing/AL2401/AL2401_mllw_mhw_20250101T12.gui.json
+```
+Inside the app, **Open file…** does the same for a `.gui.json` file (without the mesh view).
+
+## Files
+| File | What it is |
+|---|---|
+| `app.py` | The local web server: run form, runs, forecast list, flight-line files |
+| `viewer/index.html`, `viewer/style.css` | The page |
+| `viewer/app.js` | Map, panels, plans display, mesh view controls |
+| `viewer/planner.js` | Flight planner |
+| `viewer/geometry.js` | Sun position, camera footprint, glare and shadow geometry |
+| `viewer/photo.js` | Simulated photo |
+| `viewer/mesh.js` | Reading and colouring the mesh water levels |
+| `<name>.gui.json` | Written by `predict.py`: lines (with every flight-lines column), photo points, matched model nodes, hourly water levels, datums and tolerance, sun elevation, windows, notes and settings |
+| `<name>.mesh.bin` | Written by `predict.py`: node positions, mesh triangles, datum heights and hourly water levels (16-bit centimetres) for every mesh node in the area |
+
+## Requirements and limits
+- Photo previews need the flight-lines columns `SCALE`, `FocalLength(M)`, `FormatX(FT)` and `FormatY(FT)`. Results made before 2026-11-26 do not include them, and results made before 2026-11-27 have no mesh file; run them again to use those features.
+- The mesh view uses the real STOFS triangles, which are downloaded once per mesh into the mesh cache (about 300 MB). Without the mesh cache, an approximate triangulation of the nodes is used and the view says so.
+- Planning does not include the actual distance to and from an airport (only the overhead per flight), weather, or airspace.
+- The photo preview assumes a vertical camera and flat ground and water at the file's ground elevation.
 
 #### Disclaimer
 This repository is a scientific product and is not official communication of the National Oceanic and Atmospheric Administration, or the United States Department of Commerce. All NOAA GitHub project code is provided on an "as is" basis and the user assumes responsibility for its use. Any claims against the Department of Commerce or Department of Commerce bureaus stemming from the use of this GitHub project will be governed by all applicable Federal law. Any reference to specific commercial products, processes, or services by service mark, trademark, manufacturer, or otherwise, does not constitute or imply their endorsement, recommendation or favoring by the Department of Commerce. The Department of Commerce seal and logo, or the seal and logo of a DOC bureau, shall not be used in any manner to imply endorsement of any commercial product or activity by DOC or the United States Government.
 
 # Changelog
 
+## 2026-11-27
+
+### Enhancements
+- **STOFS water levels on the mesh** in the results viewer: a map view option (off by default) with a time bar, coloured by water level relative to local mean sea level or a datum, with the mesh edges.
+  - `predict.py` also writes `<name>.mesh.bin` (`outputs.mesh_levels_prediction`): node positions, mesh triangles, datum heights and hourly water levels for every mesh node in the survey area, compactly as 16-bit centimetres. About 24 MB for AL2401 (57,941 nodes, 114,308 triangles, 186 hours). If writing it fails, the error is logged and the other outputs are unaffected.
+  - The STOFS triangle list (~300 MB for the global mesh) is downloaded once per mesh into the mesh cache (`element.npy`) and spot-checked against the forecast file on later runs. Without the mesh cache, or with the xarray-subset-grid loader, an approximate (Delaunay) triangulation of the nodes is used instead and labelled as such in the viewer.
+  - `app.py` serves the file at `/api/runs/<id>/mesh`.
+- **README:** the app and results viewer are now described together in a new "Visualization app" section.
+
 ## 2026-11-26
 
 ### Enhancements
+- **App** (`app.py`). `python app.py` opens a local web app to start runs and see the results, with no other steps. See "Visualization app" above.
+  - Choosing a flight-lines file, or uploading one, draws its lines on the map before the run.
+  - The run form lists the flight-line files in `data/` (or takes an upload, checked for the required columns), the STOFS forecast cycles available on NOAA's S3 from the last four days, the datums, the minimum sun elevation, points per line and output time zone.
+  - Each run calls `predict.py` in its own process and folder under `runs/` (ignored by git). Progress, a cancel button and the log are shown while it runs, and the results open when it finishes. Past runs are listed and can be reopened.
+  - Only the Python standard library is used; no new dependencies.
+- **Results viewer** (`viewer/`), built on deck.gl and MapLibre with no build step. It plans the flights and shows what each photo would look like. See "Visualization app" above.
+  - **Flight plans** (`viewer/planner.js`): a recommended plan and alternates (finish soonest, fewest flights, best value, best single flight), each a set of flights with the order and time of every line, shown on the map. Planning assumptions are editable. For AL2401 (MLLW, 26 Nov 18Z forecast) the recommended plan flies all 17 lines that have windows in 3 flights, 2.2 h on site.
+  - **Photo preview** (`viewer/photo.js`, `viewer/geometry.js`): clicking a photo point renders a simulated photo from Esri World Imagery, cut to the photo footprint and turned to the flight direction, lit for the sun at the planned time, with sun glint on water.
+  - Clicking a line shows every column of its flight-lines file row in a popup.
+  - Arrows beside planned lines show the direction each line is flown; the map stays north-up.
+  - Planning assumptions update the plans as you type, with a message saying whether the recommended plan changed, and a reset button.
+  - `predict.py` now also writes `<name>.gui.json` (`outputs.gui_json_prediction`) with the flight lines, photo points, matched model nodes and their distance, hourly forecast water level, datum levels and tolerance, hourly solar elevation, line and point windows, notes and run settings. It also stores every column of the flight-lines file for each line. It is about 1.8 MB for the AL2401 example. If writing it fails, the error is logged and the other outputs are unaffected.
 - **Mesh cache.** In the byte-range loading mode, the STOFS mesh node coordinates and the local mean sea level (LMSL) field are now cached on disk after the first run. Later runs on the same mesh skip downloading them. See "Mesh cache" above.
   - For the AL2401 example, a run took 75 s with a warm cache versus 90 s without the cache, with identical output files. Most of the remaining time (about 50 s) is downloading the forecast water levels, which change with every forecast and cannot be cached. The first run on a new mesh downloads about 460 MB once (the mesh coordinates, plus the LMSL field and its coordinates for the mesh check) and stores about 255 MB on disk.
   - Before a cached mesh is used, the forecast file's mesh is fingerprinted: dimension sizes, 32,768 sampled node coordinates and the open-boundary arrays (`mesh_handling.mesh_fingerprint`). Each STOFS mesh gets its own cache entry, so a new mesh, for example after a STOFS upgrade, is never mistaken for a cached one.
