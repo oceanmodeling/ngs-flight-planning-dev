@@ -51,8 +51,7 @@ def main(
     output_dir: pathlib.Path | str,
     min_solar_elevation: float,
     output_time_zone: str,
-    every_nth_point: int,
-    mesh_cache: bool | str | pathlib.Path = True
+    every_nth_point: int
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run NGS flight planning data processing on STOFS forecast data.
 
@@ -86,10 +85,6 @@ def main(
         0 = first and last only;
         1 = every point;
         N (integer) = every Nth point.
-    mesh_cache
-        Where to cache STOFS mesh coordinates and LMSL between runs:
-        True for the default location, a directory path, or False to
-        disable. See mesh_handling.load_forecast_ds.
 
     Returns
     -------
@@ -120,18 +115,14 @@ def main(
     # Load and subset forecast and datum data.
     logger.info('Loading forecast subset...')
     bbox = mesh_handling.get_box(df_lines)    
-    ds_mesh = mesh_handling.load_forecast_ds(
-        init_datetime, bbox, convert_to_local_msl=True, mesh_cache=mesh_cache
-    )
+    ds_mesh = mesh_handling.load_forecast_ds(init_datetime, bbox, convert_to_local_msl=True)
     logger.info('Finished loading forecast subset.')
     
     logger.info('Adding datums...')
     # Get list of datums to add.
-    # We want all in `datums`, except BMHW, plus MHW, MLW and MLLW to calculate
-    # range (MHW - MLW, or MHW - MLLW for West Coast/Alaska). Adding them here,
-    # on the full mesh, means ds_add_tidal_range never has to add one later.
+    # We want all in `datums`, except BMHW, plus MLW and MHW to calculate range.
     datums_to_add = [d for d in datums if d != 'bmhw']
-    for datum in list(set(datums_to_add + ['mhw', 'mlw', 'mllw'])):
+    for datum in list(set(datums_to_add + ['mhw', 'mlw'])):
         ds_mesh = mesh_handling.ds_add_datum(ds_mesh, datum)
     logger.info('Finished adding datums...')
     
@@ -217,15 +208,6 @@ def main(
     )
     logger.info('Finished calculating windows by line.')
 
-    # Explain any datums with no windows at all, so it's clear to the
-    # user why (sun too low, water never in range, or no line-wide overlap).
-    notes = processing.explain_missing_windows(
-        df_interp, df_point_windows, df_line_windows, datums,
-        min_solar_elevation, point_step=every_nth_point
-    )
-    for note in notes:
-        logger.warning(note)
-
     logger.warning(f'Converting times to {output_time_zone}...')
     logger.warning('ATTENTION: Take care when using time information in GIS software. Geopackage (.gpkg) files may contain timezone information, but shapefiles (.shp) do not.')
     logger.debug('Before conversion:')
@@ -243,7 +225,7 @@ def main(
     outputs.output_all_prediction(df_lines, df_line_windows, 
                                   df_points, df_point_windows, 
                                   project_name, datums, init_datetime,
-                                  save_dir, notes=notes)
+                                  save_dir)
     return df_point_windows, df_line_windows
 
 
@@ -271,10 +253,6 @@ def ngs_arg_parser():
     parser.add_argument('-n', '--every_nth_point', type=int, 
                         default=1,
                         help="The number of points to use when calculating a line's time window (default: %(default)s). '0' means only use the end points. '1' means use every point. Integer N means use every Nth point.")
-    parser.add_argument('--mesh-cache-dir', type=str, default=None,
-                        help="Directory for caching STOFS mesh coordinates and LMSL between runs (default: $NGS_MESH_CACHE_DIR, or ~/.cache/ngs-flight-planning/meshes). Each STOFS mesh is fingerprinted and cached separately.")
-    parser.add_argument('--no-mesh-cache', action='store_true',
-                        help="Do not read or write the mesh cache.")
     parser.add_argument('-l', '--logging-level', type=str,
                         default='INFO',
                         help="Logging level passed to program logger ( one of ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] default: %(default)s)")
@@ -295,6 +273,5 @@ if __name__ == '__main__':
         pathlib.Path(args.output_directory).resolve(),
         args.min_solar_elevation,
         args.output_time_zone,
-        args.every_nth_point,
-        False if args.no_mesh_cache else (args.mesh_cache_dir or True)
+        args.every_nth_point
     )
