@@ -109,10 +109,30 @@ AL2401_qc_mllw_mhw_20241217T12_qc.shx
 AL2401_qc_mllw_mhw_20241217T12_qc.dbf
 ```
 
+## Mesh cache
+When the STOFS forecast file stores water levels uncompressed, the scripts read only the parts they need (see the Changelog). In that mode, the mesh node coordinates (about 205 MB) and the local mean sea level field (about 50 MB) are the same for every forecast on a given STOFS mesh, so they are cached on disk after the first run.
+
+- **Location:** `~/.cache/ngs-flight-planning/meshes/` by default. Set the `NGS_MESH_CACHE_DIR` environment variable, or pass `--mesh-cache-dir <dir>` to `predict.py` or `qc.py`, to use another directory. Pass `--no-mesh-cache` to neither read nor write the cache.
+- **One entry per mesh.** Each run fingerprints the forecast file's mesh before using the cache: the mesh dimension sizes, the coordinates of 32,768 nodes (64 evenly spaced blocks of 512 consecutive nodes), and the open-boundary arrays. This downloads about 0.5 MB and takes a few seconds. A different mesh, for example after a STOFS upgrade, gets its own `mesh_<fingerprint>` folder, so meshes are never mixed up.
+- **Extra checks.**
+  - The coordinates of every node the run actually uses are compared with the forecast file. If any differ, the entry is downloaded again and replaced.
+  - The cached LMSL is used only if the LMSL file on S3 is unchanged (same ETag).
+- **Clearing the cache.** It is safe to delete the cache folder at any time; it is rebuilt on the next run. The first run on a new mesh takes longer, because it downloads the full coordinate and LMSL fields once.
+
 #### Disclaimer
 This repository is a scientific product and is not official communication of the National Oceanic and Atmospheric Administration, or the United States Department of Commerce. All NOAA GitHub project code is provided on an "as is" basis and the user assumes responsibility for its use. Any claims against the Department of Commerce or Department of Commerce bureaus stemming from the use of this GitHub project will be governed by all applicable Federal law. Any reference to specific commercial products, processes, or services by service mark, trademark, manufacturer, or otherwise, does not constitute or imply their endorsement, recommendation or favoring by the Department of Commerce. The Department of Commerce seal and logo, or the seal and logo of a DOC bureau, shall not be used in any manner to imply endorsement of any commercial product or activity by DOC or the United States Government.
 
 # Changelog
+
+## 2026-11-26
+
+### Enhancements
+- **Mesh cache.** In the byte-range loading mode, the STOFS mesh node coordinates and the local mean sea level (LMSL) field are now cached on disk after the first run. Later runs on the same mesh skip downloading them. See "Mesh cache" above.
+  - For the AL2401 example, a run took 75 s with a warm cache versus 90 s without the cache, with identical output files. Most of the remaining time (about 50 s) is downloading the forecast water levels, which change with every forecast and cannot be cached. The first run on a new mesh downloads about 460 MB once (the mesh coordinates, plus the LMSL field and its coordinates for the mesh check) and stores about 255 MB on disk.
+  - Before a cached mesh is used, the forecast file's mesh is fingerprinted: dimension sizes, 32,768 sampled node coordinates and the open-boundary arrays (`mesh_handling.mesh_fingerprint`). Each STOFS mesh gets its own cache entry, so a new mesh, for example after a STOFS upgrade, is never mistaken for a cached one.
+  - On every cache hit, the coordinates of all nodes the run actually uses are also compared with the forecast file. If any differ, the cache entry is downloaded again and replaced.
+  - The cached LMSL is used only if the LMSL file on S3 is unchanged (same ETag). When the LMSL cache is built, the LMSL file's coordinates are checked against the forecast mesh at every node.
+  - New options for `predict.py` and `qc.py`: `--mesh-cache-dir <dir>` and `--no-mesh-cache`. The `NGS_MESH_CACHE_DIR` environment variable also sets the location. In Python, use `load_forecast_ds(..., mesh_cache=...)`.
 
 ## 2026-11-25
 
@@ -122,7 +142,6 @@ This repository is a scientific product and is not official communication of the
   - `predict.py` and `qc.py` now always add MLLW, along with MHW and MLW, before matching nodes.
 - **Crash when no time windows are found** (`KeyError: 0` in `outputs.line_text_prediction`). This happened, for example, in Alaska in late autumn, when the sun never reaches the minimum solar elevation. The text outputs now write a clear message instead, and the other output files are still written.
 - **Silent all-NaN water levels in `processing.interp_time`.** The one-minute time axis was always built in nanoseconds. If the forecast's time axis used another unit (pandas 3 defaults to microseconds), every interpolated value became NaN and no windows were found. The new axis now uses the same unit as the data. Real STOFS data uses nanoseconds, so earlier runs were not affected.
-
 - **`xarray-subset-grid` fails to import on Python 3.11/3.12** with its latest GitHub commits. `requirements.txt` and `dev_requirements.txt` now pin commit `f96a90b`. See "Note on `xarray-subset-grid`" above.
 
 ### Enhancements

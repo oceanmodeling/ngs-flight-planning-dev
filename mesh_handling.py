@@ -5,6 +5,7 @@ Functions
 get_box
 load_forecast_ds
 zeta_byte_range_layout
+mesh_fingerprint
 get_nearest_inds_dists
 ds_add_datum
 ds_add_tidal_range
@@ -25,6 +26,10 @@ import scipy
 import s3fs
 import xarray_subset_grid
 import math
+import os
+import json
+import hashlib
+import pathlib
 import asyncio
 import concurrent.futures
 import obstore
@@ -69,7 +74,8 @@ LMSL_PATH = 'noaa-nos-stofs2d-pds/_archive/msl_2017-2019_avg/GSTOFSv5.6.5_msl_20
 def load_forecast_ds(init_datetime: datetime.datetime,
                      bbox: shapely.box,
                      convert_to_local_msl: bool = True,
-                     allow_byte_ranges: bool = True) -> xarray.Dataset:
+                     allow_byte_ranges: bool = True,
+                     mesh_cache: bool | str | pathlib.Path = True) -> xarray.Dataset:
     """Load STOFS-2D-Global forecast water levels for a lat-lon box.
 
     Hardcoded to return a single STOFS-2D-Global forecast run.
@@ -81,9 +87,12 @@ def load_forecast_ds(init_datetime: datetime.datetime,
       which makes the byte position of every (time, node) value
       computable. Only the bytes for nodes inside bbox are downloaded,
       instead of whole 12.8 MB global chunks for every time step.
+      The mesh node coordinates and LMSL values, which are the same for
+      every forecast on a given mesh, can be cached on disk (see
+      mesh_cache).
     * xarray-subset-grid (slow, ~5+ minutes). Used if the data are
       compressed or filtered, if allow_byte_ranges is False, or if
-      the fast method fails for any reason.
+      the fast method fails for any reason. Does not use the cache.
 
     Both return the same structure: zeta (time, node) for nodes in bbox,
     with lat and lon coordinates.
@@ -99,6 +108,14 @@ def load_forecast_ds(init_datetime: datetime.datetime,
     allow_byte_ranges
         Whether the fast byte-range method may be used (when the source
         file allows it). Set False to force the xarray-subset-grid method.
+    mesh_cache
+        Where to cache mesh node coordinates and LMSL values between runs.
+        True (default) uses $NGS_MESH_CACHE_DIR if set, otherwise
+        ~/.cache/ngs-flight-planning/meshes. A path uses that directory.
+        False disables the cache. Before a cached mesh is used, the
+        forecast file's mesh is fingerprinted (sizes, sampled node
+        coordinates and boundary arrays), so a different STOFS mesh is
+        never mistaken for a cached one; each mesh gets its own entry.
 
     Returns
     -------
@@ -133,7 +150,13 @@ def load_forecast_ds(init_datetime: datetime.datetime,
     logger.info('Finished opening data file.')
 
     if allow_byte_ranges:
-        layout = zeta_byte_range_layout(manifest_store)
+        try:
+            vds = manifest_store.to_virtual_dataset()
+        except Exception as e:
+            vds = None
+            layout = f'could not read chunk manifest: {e!r}'
+        else:
+            layout = zeta_byte_range_layout(vds)
         if isinstance(layout, str):
             logger.info(f'Byte-range loading not possible ({layout}). '
                         'Using xarray-subset-grid instead (slower).')
@@ -142,7 +165,8 @@ def load_forecast_ds(init_datetime: datetime.datetime,
                         'using byte-range loading.')
             try:
                 return _load_forecast_byte_ranges(
-                    store, ds, layout, bbox, convert_to_local_msl
+                    store, ds, vds, layout, bbox, convert_to_local_msl,
+                    _mesh_cache_root(mesh_cache)
                 )
             except Exception as e:
                 logger.warning(f'Byte-range loading failed ({e!r}). '
@@ -153,7 +177,7 @@ def load_forecast_ds(init_datetime: datetime.datetime,
     return _load_forecast_xsg(ds, bbox, convert_to_local_msl)
 
 
-def zeta_byte_range_layout(manifest_store, var: str = 'zeta') -> dict | str:
+def zeta_byte_range_layout(vds, var: str = 'zeta') -> dict | str:
     """Check whether a variable can be read with plain byte-range requests.
 
     This is only safe when every chunk is stored as raw bytes: no
@@ -162,8 +186,9 @@ def zeta_byte_range_layout(manifest_store, var: str = 'zeta') -> dict | str:
 
     Parameters
     ----------
-    manifest_store
-        VirtualiZarr ManifestStore for the forecast file.
+    vds
+        Virtual dataset for the forecast file (from
+        ManifestStore.to_virtual_dataset()), or the ManifestStore itself.
     var
         Name of the variable to check.
 
@@ -173,10 +198,22 @@ def zeta_byte_range_layout(manifest_store, var: str = 'zeta') -> dict | str:
     otherwise a string giving the reason they are not.
 
     """
-    try:
-        vds = manifest_store.to_virtual_dataset()
-    except Exception as e:
-        return f'could not read chunk manifest: {e!r}'
+    layout = _raw_chunk_layout(vds, var)
+    if isinstance(layout, dict) and len(layout['shape']) != 2:
+        return f"{var} has {len(layout['shape'])} dimensions, expected 2 (time, node)"
+    return layout
+
+
+def _raw_chunk_layout(vds, var: str) -> dict | str:
+    """Chunk layout of a variable stored as raw bytes, or why it is not.
+
+    Works for any number of dimensions. See zeta_byte_range_layout.
+    """
+    if hasattr(vds, 'to_virtual_dataset'):
+        try:
+            vds = vds.to_virtual_dataset()
+        except Exception as e:
+            return f'could not read chunk manifest: {e!r}'
     if var not in vds.variables:
         return f'variable {var} not found'
     marr = vds[var].data
@@ -193,8 +230,6 @@ def zeta_byte_range_layout(manifest_store, var: str = 'zeta') -> dict | str:
     dtype = numpy.dtype(meta['data_type']).newbyteorder('<' if endian == 'little' else '>')
     shape = tuple(meta['shape'])
     chunk_shape = tuple(meta['chunk_grid']['configuration']['chunk_shape'])
-    if len(shape) != 2:
-        return f'{var} has {len(shape)} dimensions, expected 2 (time, node)'
     n_chunks = tuple(math.ceil(s / c) for s, c in zip(shape, chunk_shape))
     chunk_bytes = math.prod(chunk_shape) * dtype.itemsize
     entries = marr.manifest.dict()
@@ -253,8 +288,10 @@ def _read_nodes_byte_ranges(store, layout: dict, node_idx: numpy.ndarray,
             requests.setdefault(path, []).append((start, start + (r1 - r0) * item, t, r0, r1))
     n_req = sum(len(v) for v in requests.values())
     n_bytes = sum(e - s for v in requests.values() for s, e, *_ in v)
-    logger.info(f'Fetching {len(node_idx)} nodes x {n_time} times: {len(runs)} node '
-                f'runs, {n_req} byte ranges, {n_bytes / 1e6:.1f} MB.')
+    # Small single-time reads (mesh checks) are logged at debug level only.
+    log = logger.info if n_time > 1 else logger.debug
+    log(f'Fetching {len(node_idx)} nodes x {n_time} times: {len(runs)} node '
+        f'runs, {n_req} byte ranges, {n_bytes / 1e6:.1f} MB.')
     # Fetch: one batch per (file, time step), with up to max_concurrency
     # batches in flight. Many small ranges are latency-bound, so running
     # them concurrently matters far more than the number of bytes.
@@ -301,18 +338,20 @@ def _run_coroutine(coro):
         return pool.submit(asyncio.run, coro).result()
 
 
-def _load_forecast_byte_ranges(store, ds: xarray.Dataset, layout: dict,
+def _load_forecast_byte_ranges(store, ds: xarray.Dataset, vds, layout: dict,
                                bbox: shapely.box,
-                               convert_to_local_msl: bool) -> xarray.Dataset:
+                               convert_to_local_msl: bool,
+                               cache_root: pathlib.Path | None = None) -> xarray.Dataset:
     """Load zeta for nodes in bbox via byte-range reads (see load_forecast_ds)."""
-    logger.info('Loading mesh node coordinates...')
-    x = ds['x'].values
-    y = ds['y'].values
-    minx, miny, maxx, maxy = bbox.bounds
-    lon = switch_lon_lims(x, min_lon=-180.0) if minx < 0 else switch_lon_lims(x, min_lon=0.0)
-    node_idx = numpy.flatnonzero((lon >= minx) & (lon <= maxx) & (y >= miny) & (y <= maxy))
-    if len(node_idx) == 0:
-        raise ValueError(f'no forecast mesh nodes inside box {bbox.bounds}')
+    x, y, cache_entry, from_cache = _get_mesh_coords(store, ds, vds, cache_root)
+    node_idx = _nodes_in_box(x, y, bbox)
+    if from_cache and not _cached_nodes_match(store, vds, node_idx, x, y):
+        # The fingerprint matched but the nodes we need differ: the cache
+        # entry is wrong for this mesh. Download and replace it.
+        logger.warning('Cached mesh coordinates differ from the forecast file at '
+                       'the nodes in the box: downloading and replacing the cache entry.')
+        x, y, cache_entry = _refresh_mesh_cache(ds, cache_entry)
+        node_idx = _nodes_in_box(x, y, bbox)
     logger.info(f'{len(node_idx)} mesh nodes inside the box.')
 
     logger.info('Loading water levels with byte-range requests...')
@@ -332,26 +371,290 @@ def _load_forecast_byte_ranges(store, ds: xarray.Dataset, layout: dict,
     )
 
     if convert_to_local_msl:
-        logger.info('Opening LMSL dataset...')
-        s3 = s3fs.S3FileSystem(anon=True)
-        ds_lmsl = xarray.open_dataset(s3.open(f's3://{LMSL_PATH}', 'rb'))
-        if ds_lmsl.sizes['node'] != ds.sizes['node']:
-            raise ValueError(
-                f"LMSL file has {ds_lmsl.sizes['node']} nodes but the forecast mesh has "
-                f"{ds.sizes['node']}: the meshes differ, so LMSL cannot be subtracted."
-            )
-        logger.info('Loading LMSL for nodes in the box...')
-        lmsl_sub = ds_lmsl.isel(node=node_idx).load()
-        if not (numpy.allclose(lmsl_sub['x'].values, x[node_idx]) and
-                numpy.allclose(lmsl_sub['y'].values, y[node_idx])):
-            raise ValueError('LMSL node coordinates differ from the forecast mesh.')
+        lmsl = _get_lmsl_for_nodes(node_idx, x, y, cache_entry)
         logger.info('Subtracting LMSL...')
-        subset_ds['zeta'] = subset_ds['zeta'] - xarray.DataArray(
-            lmsl_sub['mean_sea_level'].values, dims=['node']
-        )
+        subset_ds['zeta'] = subset_ds['zeta'] - xarray.DataArray(lmsl, dims=['node'])
 
     logger.info('Renaming x and y coordinates to match thalassa.')
     return subset_ds.rename({'x':'lon', 'y':'lat'})
+
+
+# ---------------------------------------------------------------------------
+# Mesh cache
+#
+# Node coordinates (x, y: ~205 MB) and LMSL (~50 MB) are the same for every
+# forecast on a given STOFS mesh. They are cached on disk in one directory
+# per mesh, named by a fingerprint computed from the forecast file itself on
+# every run, so a different mesh (e.g., after a STOFS upgrade) gets its own
+# entry and is never confused with a cached one.
+# ---------------------------------------------------------------------------
+
+MESH_CACHE_ENV_VAR = 'NGS_MESH_CACHE_DIR'
+MESH_FINGERPRINT_BLOCKS = 64       # evenly spaced blocks of nodes ...
+MESH_FINGERPRINT_BLOCK_SIZE = 512  # ... of this many consecutive nodes each
+
+
+def _mesh_cache_root(mesh_cache: bool | str | pathlib.Path | None) -> pathlib.Path | None:
+    """Resolve the mesh_cache argument of load_forecast_ds to a directory."""
+    if mesh_cache is None or mesh_cache is False:
+        return None
+    if mesh_cache is True:
+        env = os.environ.get(MESH_CACHE_ENV_VAR)
+        if env:
+            return pathlib.Path(env).expanduser()
+        return pathlib.Path.home() / '.cache' / 'ngs-flight-planning' / 'meshes'
+    return pathlib.Path(mesh_cache).expanduser()
+
+
+def _nodes_in_box(x: numpy.ndarray, y: numpy.ndarray, bbox: shapely.box) -> numpy.ndarray:
+    """Indices of mesh nodes inside a lon-lat box."""
+    minx, miny, maxx, maxy = bbox.bounds
+    lon = switch_lon_lims(x, min_lon=-180.0) if minx < 0 else switch_lon_lims(x, min_lon=0.0)
+    node_idx = numpy.flatnonzero((lon >= minx) & (lon <= maxx) & (y >= miny) & (y <= maxy))
+    if len(node_idx) == 0:
+        raise ValueError(f'no forecast mesh nodes inside box {bbox.bounds}')
+    return node_idx
+
+
+def _cached_nodes_match(store, vds, node_idx, x, y) -> bool:
+    """Check cached x, y against the forecast file at exactly these nodes."""
+    for var, cached in (('x', x), ('y', y)):
+        actual = _read_1d_nodes(store, _raw_chunk_layout(vds, var), node_idx)
+        if not numpy.array_equal(actual, cached[node_idx]):
+            return False
+    logger.info(f'Cached coordinates verified at all {len(node_idx)} nodes in the box.')
+    return True
+
+
+def mesh_fingerprint(store, ds: xarray.Dataset, vds,
+                     n_blocks: int = MESH_FINGERPRINT_BLOCKS,
+                     block_size: int = MESH_FINGERPRINT_BLOCK_SIZE) -> tuple[str, dict]:
+    """Fingerprint the mesh of a forecast file without downloading all of it.
+
+    Combines:
+      * the mesh dimension sizes (nodes, elements, boundaries),
+      * x and y for n_blocks evenly spaced blocks of block_size
+        consecutive nodes (32,768 nodes and ~0.5 MB by default, read
+        with one byte-range request per block),
+      * the small boundary arrays (nvell, ibtype, nbvv), if present.
+
+    Parameters
+    ----------
+    store
+        obstore store for the forecast bucket.
+    ds
+        The forecast dataset (opened lazily).
+    vds
+        Virtual dataset for the forecast file (holds the chunk manifests).
+    n_blocks, block_size
+        How many blocks of nodes to sample, and how many nodes per block.
+
+    Returns
+    -------
+    Tuple of (fingerprint string, dict of sampled node indices and values,
+    used to double-check cached coordinates before they are used).
+
+    Raises
+    ------
+    ValueError if x or y are not stored as raw bytes (so cannot be sampled
+    cheaply); the caller then skips the cache.
+
+    """
+    sizes = {d: int(ds.sizes[d]) for d in ('node', 'nfaces', 'nvertex', 'nbou', 'nvel')
+             if d in ds.sizes}
+    h = hashlib.sha256(json.dumps(sizes, sort_keys=True).encode())
+    n_node = sizes['node']
+    block_size = min(block_size, n_node)
+    starts = numpy.unique(numpy.linspace(0, n_node - block_size, n_blocks).astype('int64'))
+    idx = numpy.unique((starts[:, None] + numpy.arange(block_size)[None, :]).ravel())
+    samples = {'idx': idx}
+    for var in ('x', 'y'):
+        layout = _raw_chunk_layout(vds, var)
+        if isinstance(layout, str):
+            raise ValueError(f'cannot sample mesh coordinates ({layout})')
+        if len(layout['shape']) != 1 or layout['shape'][0] != n_node:
+            raise ValueError(f'{var} has unexpected shape {layout["shape"]}')
+        samples[var] = _read_1d_nodes(store, layout, idx)
+        h.update(samples[var].astype('<f8').tobytes())
+    for var in ('nvell', 'ibtype', 'nbvv'):
+        if var in ds.variables:
+            h.update(var.encode())
+            h.update(numpy.ascontiguousarray(ds[var].values).astype('<i8').tobytes())
+    return h.hexdigest()[:16], samples
+
+
+def _read_1d_nodes(store, layout: dict, node_idx: numpy.ndarray) -> numpy.ndarray:
+    """Read a raw 1D variable at the given node indices, using byte ranges.
+
+    Reuses the (time, node) reader by treating the variable as one time
+    step, so runs of consecutive indices are fetched as single ranges.
+    """
+    layout2d = dict(layout, shape=(1, layout['shape'][0]),
+                    chunk_shape=(1, layout['chunk_shape'][0]),
+                    chunks={(0, c): v for (c,), v in layout['chunks'].items()})
+    # max_gap_nodes=1: merge only consecutive nodes, so no extra bytes are read.
+    return _read_nodes_byte_ranges(store, layout2d, node_idx, max_gap_nodes=1)[0].astype('float64')
+
+
+def _get_mesh_coords(store, ds: xarray.Dataset, vds,
+                     cache_root: pathlib.Path | None) -> tuple:
+    """Get global node coordinates x, y, from the mesh cache if possible.
+
+    Returns
+    -------
+    Tuple of (x, y, cache entry directory or None if the cache is not
+    used, whether x and y came from the cache).
+
+    """
+    def download():
+        logger.info('Downloading mesh node coordinates...')
+        return ds['x'].values, ds['y'].values
+
+    if cache_root is None:
+        logger.info('Mesh cache disabled.')
+        x, y = download()
+        return x, y, None, False
+    try:
+        fingerprint, samples = mesh_fingerprint(store, ds, vds)
+    except Exception as e:
+        logger.info(f'Mesh cache not used: {e}')
+        x, y = download()
+        return x, y, None, False
+
+    entry = cache_root / f'mesh_{fingerprint}'
+    n_node = int(ds.sizes['node'])
+    idx = samples['idx']
+    x_file, y_file = entry / 'x.npy', entry / 'y.npy'
+    if x_file.exists() and y_file.exists():
+        try:
+            x = numpy.load(x_file)
+            y = numpy.load(y_file)
+            if (len(x) == n_node and len(y) == n_node and
+                    numpy.array_equal(x[idx], samples['x']) and
+                    numpy.array_equal(y[idx], samples['y'])):
+                logger.info(f'Using cached mesh {fingerprint} ({entry}).')
+                return x, y, entry, True
+            logger.warning(f'Cached mesh files in {entry} do not match the forecast '
+                           'file: downloading and replacing them.')
+        except Exception as e:
+            logger.warning(f'Could not read cached mesh in {entry} ({e!r}): '
+                           'downloading and replacing it.')
+
+    logger.info(f'Mesh {fingerprint} is not cached yet: downloading it once '
+                f'and saving it to {entry}.')
+    x, y = download()
+    if not (numpy.array_equal(x[idx], samples['x']) and
+            numpy.array_equal(y[idx], samples['y'])):
+        # Should never happen; means the byte-range samples are wrong.
+        logger.error('Mesh fingerprint samples do not match the downloaded '
+                     'coordinates: not caching this mesh.')
+        return x, y, None, False
+    try:
+        _save_cache_files(entry, {'x.npy': x, 'y.npy': y}, 'mesh.json', {
+            'fingerprint': fingerprint,
+            'n_node': n_node,
+            'sizes': {d: int(ds.sizes[d]) for d in ds.sizes},
+            'created': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'description': ds.attrs.get('description', ''),
+        })
+    except Exception as e:
+        logger.warning(f'Could not save mesh cache to {entry} ({e!r}): continuing without it.')
+        return x, y, None, False
+    return x, y, entry, False
+
+
+def _refresh_mesh_cache(ds: xarray.Dataset, entry: pathlib.Path) -> tuple:
+    """Re-download x, y and overwrite a cache entry (dropping its LMSL)."""
+    logger.info('Downloading mesh node coordinates...')
+    x, y = ds['x'].values, ds['y'].values
+    try:
+        for name in ('lmsl.npy', 'lmsl.json'):
+            (entry / name).unlink(missing_ok=True)
+        meta = json.loads((entry / 'mesh.json').read_text())
+        meta['refreshed'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _save_cache_files(entry, {'x.npy': x, 'y.npy': y}, 'mesh.json', meta)
+        return x, y, entry
+    except Exception as e:
+        logger.warning(f'Could not refresh mesh cache in {entry} ({e!r}): continuing without it.')
+        return x, y, None
+
+
+def _get_lmsl_for_nodes(node_idx: numpy.ndarray, x: numpy.ndarray, y: numpy.ndarray,
+                        cache_entry: pathlib.Path | None) -> numpy.ndarray:
+    """LMSL values at the given nodes, from the mesh cache if possible.
+
+    The cached LMSL is only used if it was made from the same LMSL file
+    (same path and S3 ETag) for this mesh. When the cache is (re)built,
+    the whole LMSL file's node coordinates are checked against the
+    forecast mesh.
+    """
+    s3 = s3fs.S3FileSystem(anon=True)
+    lmsl_file = cache_entry / 'lmsl.npy' if cache_entry is not None else None
+    lmsl_meta = cache_entry / 'lmsl.json' if cache_entry is not None else None
+    etag = None
+    if cache_entry is not None:
+        try:
+            etag = s3.info(f's3://{LMSL_PATH}').get('ETag')
+        except Exception as e:
+            logger.info(f'Could not check the LMSL file version ({e!r}): not using cached LMSL.')
+        if etag and lmsl_file.exists() and lmsl_meta.exists():
+            try:
+                meta = json.loads(lmsl_meta.read_text())
+                lmsl = numpy.load(lmsl_file, mmap_mode='r')
+                if (meta.get('path') == LMSL_PATH and meta.get('etag') == etag
+                        and len(lmsl) == len(x)):
+                    logger.info('Using cached LMSL.')
+                    return numpy.asarray(lmsl[node_idx])
+                logger.info('Cached LMSL is for a different LMSL file version: replacing it.')
+            except Exception as e:
+                logger.warning(f'Could not read cached LMSL ({e!r}): replacing it.')
+
+    logger.info('Opening LMSL dataset...')
+    ds_lmsl = xarray.open_dataset(s3.open(f's3://{LMSL_PATH}', 'rb'))
+    if ds_lmsl.sizes['node'] != len(x):
+        raise ValueError(
+            f"LMSL file has {ds_lmsl.sizes['node']} nodes but the forecast mesh has "
+            f"{len(x)}: the meshes differ, so LMSL cannot be subtracted."
+        )
+
+    if cache_entry is not None and etag:
+        logger.info('Downloading the global LMSL field once for the mesh cache...')
+        lx, ly = ds_lmsl['x'].values, ds_lmsl['y'].values
+        if not (numpy.allclose(lx, x) and numpy.allclose(ly, y)):
+            raise ValueError('LMSL node coordinates differ from the forecast mesh.')
+        lmsl = ds_lmsl['mean_sea_level'].values
+        try:
+            _save_cache_files(cache_entry, {'lmsl.npy': lmsl}, 'lmsl.json',
+                              {'path': LMSL_PATH, 'etag': etag,
+                               'created': datetime.datetime.now(datetime.timezone.utc).isoformat()})
+        except Exception as e:
+            logger.warning(f'Could not save LMSL to the mesh cache ({e!r}).')
+        return lmsl[node_idx]
+
+    logger.info('Loading LMSL for nodes in the box...')
+    lmsl_sub = ds_lmsl.isel(node=node_idx).load()
+    if not (numpy.allclose(lmsl_sub['x'].values, x[node_idx]) and
+            numpy.allclose(lmsl_sub['y'].values, y[node_idx])):
+        raise ValueError('LMSL node coordinates differ from the forecast mesh.')
+    return lmsl_sub['mean_sea_level'].values
+
+
+def _save_cache_files(entry: pathlib.Path, arrays: dict, meta_name: str, meta: dict) -> None:
+    """Save arrays and a metadata file into a cache entry.
+
+    Each file is written to a temporary name and then renamed, and the
+    metadata file is written last, so an interrupted run never leaves a
+    half-written file under a real name.
+    """
+    entry.mkdir(parents=True, exist_ok=True)
+    for name, arr in arrays.items():
+        tmp = entry / f'.{name}.{os.getpid()}.tmp'
+        with open(tmp, 'wb') as f:
+            numpy.save(f, arr)
+        os.replace(tmp, entry / name)
+    tmp = entry / f'.{meta_name}.{os.getpid()}.tmp'
+    tmp.write_text(json.dumps(meta, indent=2))
+    os.replace(tmp, entry / meta_name)
 
 
 def _load_forecast_xsg(ds: xarray.Dataset, bbox: shapely.box,

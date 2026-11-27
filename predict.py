@@ -51,7 +51,8 @@ def main(
     output_dir: pathlib.Path | str,
     min_solar_elevation: float,
     output_time_zone: str,
-    every_nth_point: int
+    every_nth_point: int,
+    mesh_cache: bool | str | pathlib.Path = True
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run NGS flight planning data processing on STOFS forecast data.
 
@@ -85,6 +86,10 @@ def main(
         0 = first and last only;
         1 = every point;
         N (integer) = every Nth point.
+    mesh_cache
+        Where to cache STOFS mesh coordinates and LMSL between runs:
+        True for the default location, a directory path, or False to
+        disable. See mesh_handling.load_forecast_ds.
 
     Returns
     -------
@@ -115,7 +120,9 @@ def main(
     # Load and subset forecast and datum data.
     logger.info('Loading forecast subset...')
     bbox = mesh_handling.get_box(df_lines)    
-    ds_mesh = mesh_handling.load_forecast_ds(init_datetime, bbox, convert_to_local_msl=True)
+    ds_mesh = mesh_handling.load_forecast_ds(
+        init_datetime, bbox, convert_to_local_msl=True, mesh_cache=mesh_cache
+    )
     logger.info('Finished loading forecast subset.')
     
     logger.info('Adding datums...')
@@ -264,6 +271,10 @@ def ngs_arg_parser():
     parser.add_argument('-n', '--every_nth_point', type=int, 
                         default=1,
                         help="The number of points to use when calculating a line's time window (default: %(default)s). '0' means only use the end points. '1' means use every point. Integer N means use every Nth point.")
+    parser.add_argument('--mesh-cache-dir', type=str, default=None,
+                        help="Directory for caching STOFS mesh coordinates and LMSL between runs (default: $NGS_MESH_CACHE_DIR, or ~/.cache/ngs-flight-planning/meshes). Each STOFS mesh is fingerprinted and cached separately.")
+    parser.add_argument('--no-mesh-cache', action='store_true',
+                        help="Do not read or write the mesh cache.")
     parser.add_argument('-l', '--logging-level', type=str,
                         default='INFO',
                         help="Logging level passed to program logger ( one of ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] default: %(default)s)")
@@ -284,5 +295,6 @@ if __name__ == '__main__':
         pathlib.Path(args.output_directory).resolve(),
         args.min_solar_elevation,
         args.output_time_zone,
-        args.every_nth_point
+        args.every_nth_point,
+        False if args.no_mesh_cache else (args.mesh_cache_dir or True)
     )
