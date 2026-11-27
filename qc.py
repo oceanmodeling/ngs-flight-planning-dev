@@ -55,7 +55,8 @@ def main(
     output_dir: pathlib.Path | str,
     min_solar_elevation: float,
     output_time_zone: str,
-    water_level_units: str
+    water_level_units: str,
+    mesh_cache: bool | str | pathlib.Path = True
 ) -> pd.DataFrame:
     """
     Main entry point for post-flight QC processing using STOFS forecast water levels.
@@ -83,6 +84,10 @@ def main(
         Timezone for output times (must be a valid pytz timezone string).
     water_level_units : str
         Desired units for water level outputs (e.g., 'm', 'ft').
+    mesh_cache
+        Where to cache STOFS mesh coordinates and LMSL between runs:
+        True for the default location, a directory path, or False to
+        disable. See mesh_handling.load_forecast_ds.
 
     Returns
     -------
@@ -123,13 +128,17 @@ def main(
     # Load and subset forecast and datum data.
     logger.info('Loading forecast subset...')
     bbox = mesh_handling.get_box(df_images)
-    ds_mesh = mesh_handling.load_forecast_ds(init_datetime, bbox, convert_to_local_msl=True)
+    ds_mesh = mesh_handling.load_forecast_ds(
+        init_datetime, bbox, convert_to_local_msl=True, mesh_cache=mesh_cache
+    )
     logger.info('Finished loading forecast subset.')
     
     logger.info('Adding datums...')
-    # We want all in `datums`, except BMHW, plus MLW and MHW to calculate range.
+    # We want all in `datums`, except BMHW, plus MHW, MLW and MLLW to calculate
+    # range (MHW - MLW, or MHW - MLLW for West Coast/Alaska). Adding them here,
+    # on the full mesh, means ds_add_tidal_range never has to add one later.
     datums_to_add = [d for d in datums if d != 'bmhw']
-    for datum in list(set(datums_to_add + ['mhw', 'mlw'])):
+    for datum in list(set(datums_to_add + ['mhw', 'mlw', 'mllw'])):
         ds_mesh = mesh_handling.ds_add_datum(ds_mesh, datum)
     logger.info('Finished adding datums...')
     
@@ -292,6 +301,10 @@ def qc_arg_parser():
     parser.add_argument('-u', '--water_level_units', type=str,
                         default='file_format_default',
                         help="The vertical datum to use for water level and related outputs (e.g., 'ft', 'm', 'file_format_default' for hard-coded output format-specific units) (default: %(default)s)")
+    parser.add_argument('--mesh-cache-dir', type=str, default=None,
+                        help="Directory for caching STOFS mesh coordinates and LMSL between runs (default: $NGS_MESH_CACHE_DIR, or ~/.cache/ngs-flight-planning/meshes). Each STOFS mesh is fingerprinted and cached separately.")
+    parser.add_argument('--no-mesh-cache', action='store_true',
+                        help="Do not read or write the mesh cache.")
     parser.add_argument('-l', '--logging-level', type=str,
                         default='INFO',
                         help="Logging level passed to program logger ( one of ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] default: %(default)s)")
@@ -313,5 +326,6 @@ if __name__ == '__main__':
         pathlib.Path(args.output_directory).resolve(),
         args.min_solar_elevation,
         args.output_time_zone,
-        args.water_level_units
+        args.water_level_units,
+        False if args.no_mesh_cache else (args.mesh_cache_dir or True)
     )
